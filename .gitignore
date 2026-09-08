@@ -1,0 +1,18 @@
+# API 키, 비밀번호 등이 들어있는 파일 (절대 GitHub에 올리면 안 됨)
+.streamlit/secrets.toml
+config.py
+
+# 예전 로컬 DB 파일 (지금은 Supabase를 쓰므로 더 이상 필요 없음)
+*.db
+
+# 파이썬이 자동으로 만드는 캐시 파일
+__pycache__/
+*.pyc
+
+# 가상환경 폴더 (다른 컴퓨터에서는 새로 만들어야 하므로 GitHub에 올릴 필요 없음)
+venv/
+.venv/
+
+# 디버깅하면서 생긴 임시 결과 파일
+result.txt
+dart_output.txt
