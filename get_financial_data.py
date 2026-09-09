@@ -8,6 +8,11 @@ from stock_price import get_current_price
 #  키가 그대로 코드에 딸려 GitHub에 올라가면 안 되기 때문입니다.)
 DART_API_KEY = st.secrets["DART_API_KEY"]
 
+# OpenDART 서버에 요청을 보내고 이 시간(초)이 지나도 응답이 없으면
+# 무한정 기다리지 않고 포기합니다. (timeout을 안 정해두면 서버가 응답을
+# 안 줄 때 화면이 "조회중" 상태로 영원히 멈춰버립니다.)
+REQUEST_TIMEOUT = 10
+
 # 분기(보고서) 코드 - OpenDART가 정해놓은 규칙
 REPRT_CODES = {
     "1분기": "11013",
@@ -68,8 +73,12 @@ def get_financial_data(corp_code, bsns_year, reprt_code, fs_div="CFS"):
         "fs_div": fs_div,
     }
 
-    response = requests.get(url, params=params)
-    data = response.json()
+    try:
+        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        data = response.json()
+    except requests.exceptions.RequestException:
+        # OpenDART 서버에 연결이 안 되거나(네트워크 문제), 응답이 너무 늦는 경우입니다.
+        return {"오류": "OpenDART 서버에 연결하지 못했습니다. 잠시 후 다시 시도해주세요."}
 
     # status가 "000"이 아니면 정상 응답이 아니라는 뜻
     if data.get("status") != "000":
@@ -159,8 +168,13 @@ def get_shares_outstanding(corp_code, bsns_year, reprt_code):
         "reprt_code": reprt_code,
     }
 
-    response = requests.get(url, params=params)
-    data = response.json()
+    try:
+        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        data = response.json()
+    except requests.exceptions.RequestException:
+        # 여기서 실패해도 재무데이터(매출액 등)는 이미 받아온 뒤라,
+        # 유통주식수·PER만 "정보 없음"으로 비워두고 나머지는 정상적으로 보여줍니다.
+        return None
 
     if data.get("status") != "000":
         return None
