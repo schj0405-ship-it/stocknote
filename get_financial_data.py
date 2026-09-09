@@ -1,3 +1,5 @@
+import time
+
 import requests
 import pandas as pd
 import streamlit as st
@@ -11,7 +13,25 @@ DART_API_KEY = st.secrets["DART_API_KEY"]
 # OpenDART 서버에 요청을 보내고 이 시간(초)이 지나도 응답이 없으면
 # 무한정 기다리지 않고 포기합니다. (timeout을 안 정해두면 서버가 응답을
 # 안 줄 때 화면이 "조회중" 상태로 영원히 멈춰버립니다.)
-REQUEST_TIMEOUT = 10
+REQUEST_TIMEOUT = 15
+
+# Streamlit Community Cloud는 미국에서만 앱을 실행하는데, 그러다 보니
+# 물리적으로 먼 한국 서버(OpenDART)로 나가는 요청이 가끔 유독 늦게 오거나
+# 아예 응답이 안 오는 경우가 있습니다(Streamlit 쪽 커뮤니티에도 같은 증상이
+# 보고돼 있음). 그래서 한 번 실패하면 잠깐 쉬었다가 한 번 더 시도합니다.
+REQUEST_RETRIES = 2
+
+
+def _request_with_retry(url, params):
+    last_error = None
+    for attempt in range(REQUEST_RETRIES):
+        try:
+            return requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        except requests.exceptions.RequestException as e:
+            last_error = e
+            if attempt < REQUEST_RETRIES - 1:
+                time.sleep(1)
+    raise last_error
 
 # 분기(보고서) 코드 - OpenDART가 정해놓은 규칙
 REPRT_CODES = {
@@ -74,11 +94,13 @@ def get_financial_data(corp_code, bsns_year, reprt_code, fs_div="CFS"):
     }
 
     try:
-        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        response = _request_with_retry(url, params)
         data = response.json()
     except requests.exceptions.RequestException:
         # OpenDART 서버에 연결이 안 되거나(네트워크 문제), 응답이 너무 늦는 경우입니다.
-        return {"오류": "OpenDART 서버에 연결하지 못했습니다. 잠시 후 다시 시도해주세요."}
+        # 재시도까지 했는데도 안 되면, 배포 서버와 OpenDART 사이 네트워크가
+        # 일시적으로 불안정한 상태일 가능성이 큽니다.
+        return {"오류": "OpenDART 서버 응답이 오지 않습니다. 잠시 후 다시 시도해주세요."}
 
     # status가 "000"이 아니면 정상 응답이 아니라는 뜻
     if data.get("status") != "000":
@@ -169,7 +191,7 @@ def get_shares_outstanding(corp_code, bsns_year, reprt_code):
     }
 
     try:
-        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        response = _request_with_retry(url, params)
         data = response.json()
     except requests.exceptions.RequestException:
         # 여기서 실패해도 재무데이터(매출액 등)는 이미 받아온 뒤라,
