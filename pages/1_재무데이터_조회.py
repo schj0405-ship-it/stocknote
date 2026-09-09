@@ -1,6 +1,7 @@
 import pandas as pd
 import streamlit as st
 
+from auth import render_auth_ui
 from get_financial_data import (
     REPRT_CODES,
     find_corp_code,
@@ -10,6 +11,9 @@ from get_financial_data import (
 )
 
 st.set_page_config(page_title="스톡노트 - 재무데이터 조회", layout="centered")
+
+render_auth_ui()  # 이 화면은 로그인 없이도 누구나 쓸 수 있지만, 사이드바에 로그인 상태는 보여줍니다.
+
 st.title("재무데이터 조회")
 
 with st.form("search_form"):

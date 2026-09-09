@@ -2,23 +2,42 @@ from datetime import date
 
 import pandas as pd
 import streamlit as st
-from supabase import create_client
 
-# .streamlit/secrets.toml에 저장해둔 값으로 Supabase(클라우드 데이터베이스)에 접속합니다.
-supabase = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
+from auth import get_supabase_client, require_login
+
+st.set_page_config(page_title="스톡노트 - 투자내역", layout="centered")
+st.title("투자내역 입력")
+
+# 로그인 안 되어 있으면 여기서 화면 실행이 멈추고, 로그인/회원가입 화면만 보여줍니다.
+user = require_login()
+
+# 로그인한 사용자의 인증 정보가 실려있는 연결 객체입니다.
+# (이 객체로 trades 테이블에 접근하면, Supabase가 자동으로 "이 사람이 맞는지" 확인합니다.)
+supabase = get_supabase_client()
 
 
 def load_trades():
-    response = supabase.table("trades").select("*").order("id", desc=True).execute()
+    """로그인한 사용자 본인의 투자내역만 불러옵니다."""
+    response = (
+        supabase.table("trades")
+        .select("*")
+        .eq("user_id", user.id)
+        .order("id", desc=True)
+        .execute()
+    )
     df = pd.DataFrame(response.data)
     if not df.empty:
         # 날짜 글자(TEXT)를 화면에서 달력으로 고를 수 있는 날짜 형식으로 바꿔줍니다.
         df["buy_date"] = pd.to_datetime(df["buy_date"], errors="coerce").dt.date
         df["sell_date"] = pd.to_datetime(df["sell_date"], errors="coerce").dt.date
+        # 화면에는 본인 데이터만 보이므로 user_id 칸은 굳이 보여줄 필요가 없어 뺍니다.
+        df = df.drop(columns=["user_id"])
     return df
 
 
 def insert_trade(row):
+    row = dict(row)
+    row["user_id"] = user.id  # 어떤 사용자의 기록인지 표시해서 저장합니다.
     supabase.table("trades").insert(row).execute()
 
 
@@ -37,11 +56,11 @@ def _clean(value, default=None):
 def replace_all_trades(df):
     """
     표에서 수정한 내용을 전부 반영합니다.
-    기존 데이터를 다 지우고, 표에 있는 내용으로 다시 채워 넣는 방식입니다
+    로그인한 사용자 본인의 기존 데이터만 지우고, 표에 있는 내용으로 다시 채워 넣는 방식입니다
     (행을 수정하거나, 새 행을 추가하거나, 행을 삭제한 것 모두 이 방식으로 한 번에 반영됩니다).
+    다른 사용자의 데이터는 건드리지 않습니다.
     """
-    # id가 0 이상인 행 전체 삭제 (모든 행이 여기 해당합니다)
-    supabase.table("trades").delete().gte("id", 0).execute()
+    supabase.table("trades").delete().eq("user_id", user.id).execute()
 
     records = []
     for _, row in df.iterrows():
@@ -51,6 +70,7 @@ def replace_all_trades(df):
 
         records.append(
             {
+                "user_id": user.id,
                 "stock_name": stock_name,
                 "stock_code": str(_clean(row.get("stock_code"), "")),
                 "buy_date": str(_clean(row.get("buy_date"))) if _clean(row.get("buy_date")) else None,
@@ -68,9 +88,6 @@ def replace_all_trades(df):
     if records:
         supabase.table("trades").insert(records).execute()
 
-
-st.set_page_config(page_title="스톡노트 - 투자내역", layout="centered")
-st.title("투자내역 입력")
 
 with st.form("trade_form", clear_on_submit=True):
     col1, col2 = st.columns(2)
