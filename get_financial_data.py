@@ -41,6 +41,30 @@ REPRT_CODES = {
     "사업보고서(연간)": "11011",
 }
 
+# 매출액을 찾을 때 쓰는 기준들입니다.
+#
+# account_id는 회사마다 다르게 붙이는 "계정명(글자)"과 달리, OpenDART가
+# 회계기준(IFRS)에 맞춰 표준으로 매겨주는 "계정 코드"입니다. 예를 들어
+# 제조업 회사는 손익계산서에 "매출액"이라고 쓰지만, 알테오젠 같은
+# 바이오·라이선스 회사는 같은 항목을 "수익(매출액)"이나 "영업수익"이라고
+# 쓰는 경우가 있습니다. 글자(계정명)만 보고 "매출액"인지 판단하면 이런
+# 회사는 놓치게 되어서, 먼저 표준 코드(account_id)로 확인하고, 표준
+# 코드가 없는 회사를 위해 알려진 계정명 목록도 같이 확인합니다.
+REVENUE_ACCOUNT_IDS = {
+    "ifrs-full_Revenue",
+    "ifrs-full_RevenueFromContractsWithCustomers",
+}
+REVENUE_ACCOUNT_NAMES = {"매출액", "수익(매출액)", "영업수익", "매출"}
+
+
+def _is_revenue_item(item):
+    """이 손익계산서 항목이 '매출액'에 해당하는 항목인지 판단합니다."""
+    account_id = (item.get("account_id") or "").strip()
+    if account_id in REVENUE_ACCOUNT_IDS:
+        return True
+    name = (item.get("account_nm") or "").strip()
+    return name in REVENUE_ACCOUNT_NAMES
+
 
 def find_corp_code(company_name):
     """
@@ -140,7 +164,7 @@ def get_financial_data(corp_code, bsns_year, reprt_code, fs_div="CFS"):
         name = item.get("account_nm", "")
         detail = item.get("account_detail") or ""
 
-        if name == "매출액" and result["매출액"] is None:
+        if result["매출액"] is None and _is_revenue_item(item):
             result["매출액"] = pick_amount(item)
 
         elif "영업이익" in name and result["영업이익"] is None:
