@@ -19,7 +19,7 @@ from quarterly_compare import (
     compute_growth,
 )
 
-st.set_page_config(page_title="스톡노트 - 재무데이터 조회", layout="centered")
+st.set_page_config(page_title="스톡노트 - 재무데이터 조회", layout="wide")
 
 render_auth_ui()  # 이 화면은 로그인 없이도 누구나 쓸 수 있지만, 사이드바에 로그인 상태는 보여줍니다.
 
@@ -104,11 +104,20 @@ def style_growth_cell(value):
     return ""
 
 
-def style_metric_row(row):
-    """표의 각 줄(행)을 어떤 지표인지에 따라 다른 배경색으로 칠해줍니다."""
-    metric = row.name[0]
-    color = METRIC_COLORS.get(metric, "")
-    return [f"background-color: {color}" for _ in row]
+def build_row_background_df(row_metrics, columns):
+    """
+    표의 각 줄(행)에 지표별 배경색을 칠하기 위한 '색상표 DataFrame'을 만듭니다.
+    row_metrics는 각 줄이 어떤 지표(매출액/영업이익/당기순이익)의 줄인지를
+    순서대로 적어둔 목록입니다. ("지표" 칸 글자로 판단하지 않는 이유: 같은
+    지표의 두 번째 줄("전분기 대비")은 "지표" 칸을 빈 문자열로 비워서 위
+    칸과 하나로 합쳐 보이게 만들 것이기 때문에, 글자만 보고는 어떤 지표
+    줄인지 구분할 수 없습니다.)
+    """
+    colors = []
+    for metric in row_metrics:
+        color = METRIC_COLORS.get(metric, "")
+        colors.append([f"background-color: {color}"] * len(columns))
+    return pd.DataFrame(colors, columns=columns)
 
 
 tab_single, tab_compare = st.tabs(["단일 조회", "여러 분기 비교"])
@@ -274,8 +283,9 @@ with tab_compare:
             st.subheader(f"{compare_state['company']} 분기별 비교")
 
             labels = [f"{y}년 {q}분기" for y, q in quarters]
-            index_tuples = []
+            table_columns = ["지표", "구분"] + labels
             data_rows = []
+            row_metrics = []  # 각 줄이 어떤 지표의 줄인지 순서대로 기록(배경색 칠할 때 씀)
 
             for metric in METRICS:
                 amount_row = []
@@ -289,34 +299,45 @@ with tab_compare:
                         prev_val = values[quarters[i - 1]][metric]
                         rate = compute_growth(prev_val, val)
                         growth_row.append(format_growth(rate))
-                index_tuples.append((metric, "금액"))
-                data_rows.append(amount_row)
-                index_tuples.append((metric, "전분기 대비"))
-                data_rows.append(growth_row)
 
-            df = pd.DataFrame(
-                data_rows,
-                index=pd.MultiIndex.from_tuples(index_tuples, names=["지표", "구분"]),
-                columns=labels,
-            )
+                data_rows.append([metric, "금액"] + amount_row)
+                row_metrics.append(metric)
+                # 같은 지표의 두 번째 줄("전분기 대비")은 "지표" 칸을 빈 문자열로
+                # 둬서, 화면에 "매출액"이 두 번 겹쳐 보이지 않고 첫 줄에만
+                # 한 번 나오도록 합니다(하나로 합쳐 보이는 효과).
+                data_rows.append(["", "전분기 대비"] + growth_row)
+                row_metrics.append(metric)
 
-            styler = df.style.apply(style_metric_row, axis=1)
+            df = pd.DataFrame(data_rows, columns=table_columns)
+
+            background_df = build_row_background_df(row_metrics, df.columns)
+            styler = df.style.apply(lambda _: background_df, axis=None)
             # pandas 2.1부터는 applymap 대신 map을 쓰라고 권장하는데, 배포 서버의
             # pandas 버전이 정확히 몇인지 고정돼 있지 않아서 둘 다 지원하도록 처리합니다.
+            # 증감률 색은 분기 값 칸(labels)에만 입혀서, "지표"/"구분" 글자 칸은
+            # 그대로 두도록 subset으로 범위를 제한합니다.
             if hasattr(styler, "map"):
-                styler = styler.map(style_growth_cell)
+                styler = styler.map(style_growth_cell, subset=labels)
             else:
-                styler = styler.applymap(style_growth_cell)
+                styler = styler.applymap(style_growth_cell, subset=labels)
             styled = styler.set_properties(**{"text-align": "center"})
             # column_order를 명시적으로 지정해서, 화면(특히 좁은 화면에서
             # 가로 스크롤할 때) 분기 순서가 뒤섞이지 않고 항상 시간 순서
-            # 그대로(labels 순서 그대로) 보이도록 강제합니다.
+            # 그대로 보이도록 강제합니다. hide_index로 의미 없는 0,1,2... 번호
+            # 대신 "지표"/"구분" 칸이 표의 맨 왼쪽 라벨 역할을 하게 합니다.
             try:
                 # 최신 Streamlit은 width="stretch"를 씁니다.
-                st.dataframe(styled, width="stretch", column_order=labels)
+                st.dataframe(
+                    styled, width="stretch", column_order=table_columns, hide_index=True
+                )
             except TypeError:
                 # 배포 서버의 Streamlit 버전이 예전 것이면 옛날 옵션으로 대신 시도합니다.
-                st.dataframe(styled, use_container_width=True, column_order=labels)
+                st.dataframe(
+                    styled,
+                    use_container_width=True,
+                    column_order=table_columns,
+                    hide_index=True,
+                )
 
             st.caption(
                 "🟦 매출액 배경 · 🟩 영업이익 배경 · 🟧 당기순이익 배경  /  "
