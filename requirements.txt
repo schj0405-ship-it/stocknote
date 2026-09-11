@@ -3,3 +3,4 @@ pandas
 requests
 supabase
 lxml
+streamlit-cookies-controller

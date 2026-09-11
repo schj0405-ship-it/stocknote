@@ -1,10 +1,38 @@
 """
 로그인/회원가입 화면과, 로그인 상태를 관리하는 함수들을 모아둔 파일입니다.
 다른 화면(app.py, pages/ 안의 파일들)에서 이 파일의 함수를 가져다 씁니다.
+
+[새로고침하면 로그인이 풀리던 문제를 고친 방식]
+지금까지는 로그인 정보를 st.session_state에만 저장했습니다. 그런데
+st.session_state는 "화면을 이리저리 조작할 때"는 유지되지만, 브라우저에서
+진짜로 새로고침(F5)을 누르거나 탭을 닫았다가 다시 열면 완전히 새 화면으로
+취급되어 깨끗하게 비워집니다. 그래서 로그인이 계속 풀렸던 것입니다.
+
+이 문제를 고치려고, 로그인 정보를 "쿠키"(그 웹사이트가 사용자의 브라우저에
+남겨두는 아주 작은 저장공간 - 새로고침은 물론 브라우저를 껐다 켜도 남아있음)
+에도 같이 저장해둡니다. 화면이 새로 시작될 때, session_state에 로그인 정보가
+없으면 이 쿠키를 먼저 확인해서, 쿠키에 남아있는 정보로 자동으로 다시
+로그인 상태를 복원합니다.
 """
 
 import streamlit as st
+from datetime import datetime, timedelta, timezone
 from supabase import create_client
+from streamlit_cookies_controller import CookieController
+
+# 로그인 정보를 쿠키에 얼마나 오래 남겨둘지(이 기간 동안은 다시 로그인 안 해도 됩니다).
+COOKIE_MAX_AGE_DAYS = 30
+COOKIE_ACCESS_NAME = "stocknote_access_token"
+COOKIE_REFRESH_NAME = "stocknote_refresh_token"
+
+
+def _get_cookie_controller():
+    """
+    브라우저 쿠키를 읽고 쓰는 도구를 하나 만들어 돌려줍니다. 화면이 다시
+    그려질 때마다 새로 부르지만, 내부적으로 같은 스레드 안에서는 캐시돼서
+    성능에는 문제가 없습니다.
+    """
+    return CookieController(key="stocknote_cookie_store")
 
 
 def get_supabase_client():
@@ -31,10 +59,75 @@ def get_supabase_client():
     return client
 
 
+def _save_session(user, access_token, refresh_token):
+    """
+    로그인 정보를 이번 화면(session_state)과, 새로고침해도 남는 브라우저
+    쿠키 양쪽에 함께 저장합니다. (session_state만 쓰면 새로고침할 때
+    사라지는 게 원래 문제였습니다.)
+    """
+    st.session_state["user"] = user
+    st.session_state["access_token"] = access_token
+    st.session_state["refresh_token"] = refresh_token
+
+    controller = _get_cookie_controller()
+    expires = datetime.now(timezone.utc) + timedelta(days=COOKIE_MAX_AGE_DAYS)
+    try:
+        controller.set(COOKIE_ACCESS_NAME, access_token, expires=expires, same_site="lax")
+        controller.set(COOKIE_REFRESH_NAME, refresh_token, expires=expires, same_site="lax")
+    except Exception:
+        # 쿠키 저장이 실패해도(예: 브라우저가 쿠키를 막아둔 경우), 지금 이
+        # 화면에서 로그인 자체는 정상 진행되도록 조용히 넘어갑니다. 다만
+        # 이 경우 새로고침하면 다시 로그인해야 합니다.
+        pass
+
+
 def _clear_session():
     st.session_state["user"] = None
     st.session_state["access_token"] = None
     st.session_state["refresh_token"] = None
+
+    try:
+        controller = _get_cookie_controller()
+        controller.remove(COOKIE_ACCESS_NAME)
+        controller.remove(COOKIE_REFRESH_NAME)
+    except Exception:
+        pass
+
+
+def _restore_session_from_cookie():
+    """
+    화면이 새로 시작됐는데(예: 새로고침) session_state에 로그인 정보가 없으면,
+    브라우저 쿠키에 저장해둔 로그인 정보로 다시 로그인 상태를 복원해봅니다.
+    쿠키가 아예 없으면(로그인한 적이 없거나, 로그아웃한 상태) 아무 일도
+    하지 않고 조용히 넘어갑니다.
+    """
+    if st.session_state.get("user"):
+        return  # 이미 로그인돼 있으면 다시 할 필요 없음
+
+    try:
+        controller = _get_cookie_controller()
+        access_token = controller.get(COOKIE_ACCESS_NAME)
+        refresh_token = controller.get(COOKIE_REFRESH_NAME)
+    except Exception:
+        return
+
+    if not access_token or not refresh_token:
+        return
+
+    client = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
+    try:
+        res = client.auth.set_session(access_token, refresh_token)
+    except Exception:
+        # 쿠키에 남아있던 로그인 정보가 만료됐거나 잘못된 경우입니다.
+        # 다시 로그인해달라고 해야 하므로, 남아있는 쿠키를 정리합니다.
+        _clear_session()
+        return
+
+    if res and res.user and res.session:
+        # set_session이 access_token을 새로 갱신해줬을 수도 있어서(원래
+        # access_token은 유효기간이 짧습니다), 최신 값으로 다시 저장해서
+        # 로그인이 오래 유지되도록 합니다.
+        _save_session(res.user, res.session.access_token, res.session.refresh_token)
 
 
 def render_auth_ui():
@@ -44,6 +137,9 @@ def render_auth_ui():
     """
     if "user" not in st.session_state:
         st.session_state["user"] = None
+
+    # 새로고침으로 session_state가 비어있는 경우, 쿠키로 로그인 상태를 먼저 복원해봅니다.
+    _restore_session_from_cookie()
 
     with st.sidebar:
         st.divider()
@@ -76,9 +172,9 @@ def render_auth_ui():
                             res = client.auth.sign_in_with_password(
                                 {"email": login_email, "password": login_password}
                             )
-                            st.session_state["user"] = res.user
-                            st.session_state["access_token"] = res.session.access_token
-                            st.session_state["refresh_token"] = res.session.refresh_token
+                            _save_session(
+                                res.user, res.session.access_token, res.session.refresh_token
+                            )
                             st.rerun()
                         except Exception as e:
                             st.error(f"로그인 실패: 이메일 또는 비밀번호를 확인해주세요. ({e})")
@@ -102,9 +198,9 @@ def render_auth_ui():
                             if res.session:
                                 # Supabase 프로젝트 설정에서 "이메일 인증"이 꺼져있는 경우,
                                 # 회원가입과 동시에 바로 로그인까지 됩니다.
-                                st.session_state["user"] = res.user
-                                st.session_state["access_token"] = res.session.access_token
-                                st.session_state["refresh_token"] = res.session.refresh_token
+                                _save_session(
+                                    res.user, res.session.access_token, res.session.refresh_token
+                                )
                                 st.success("회원가입이 완료되어 바로 로그인되었습니다.")
                                 st.rerun()
                             else:
