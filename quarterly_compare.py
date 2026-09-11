@@ -16,6 +16,8 @@ get_financial_data.py에 있는 get_financial_data / REPRT_CODES 함수는
 전혀 수정하지 않고, 여기서는 그 결과를 가져다 빼기만 합니다.
 """
 
+import concurrent.futures
+
 from get_financial_data import get_financial_data, REPRT_CODES
 
 # 이 화면에서 비교할 지표 3가지 (사용자 요청: 매출액·영업이익·당기순이익)
@@ -121,6 +123,31 @@ def build_quarter_list(start_year, start_quarter, count):
     return quarters
 
 
+def _needed_reports(quarters):
+    """
+    비교하려는 분기 목록을 계산하려면 실제로 어떤 (연도, 보고서 종류)
+    조합을 OpenDART에서 받아와야 하는지 미리 뽑아둡니다. (예: 2025년
+    2분기를 계산하려면 "2025년 반기"와 "2025년 1분기" 두 보고서가
+    필요합니다.) 같은 보고서가 여러 분기 계산에 겹쳐 쓰이는 경우
+    (예: "반기" 보고서는 2분기 계산에도, 3분기 계산에도 쓰임) 중복 없이
+    한 번만 담습니다.
+    """
+    needed = set()
+    for year, quarter in quarters:
+        if quarter == 1:
+            needed.add((year, "1분기"))
+        elif quarter == 2:
+            needed.add((year, "반기"))
+            needed.add((year, "1분기"))
+        elif quarter == 3:
+            needed.add((year, "3분기"))
+            needed.add((year, "반기"))
+        elif quarter == 4:
+            needed.add((year, "사업보고서(연간)"))
+            needed.add((year, "3분기"))
+    return needed
+
+
 def build_comparison_data(corp_code, quarters):
     """
     quarters: [(연도, 분기), ...] (시간 순서)
@@ -129,8 +156,32 @@ def build_comparison_data(corp_code, quarters):
     - values: {(연도, 분기): {"매출액": .., "영업이익": .., "당기순이익": ..}}
       (오류가 난 분기는 세 지표 모두 None으로 채워서, 표를 그릴 때 예외 처리를 안 해도 되게 함)
     - errors: {(연도, 분기): "오류 안내 문구"}  (오류 없으면 빈 딕셔너리)
+
+    필요한 보고서들을 하나씩 순서대로 기다리지 않고 동시에(병렬로)
+    요청합니다. 예를 들어 4개 분기를 비교하면 서로 다른 보고서를 최대
+    4번 받아와야 하는데, 하나씩 순서대로 기다리면 느린 요청 하나 때문에
+    전체가 오래 걸립니다(배포 서버가 있는 미국에서 한국 서버로 요청을
+    보내다 보니 가끔 응답이 느립니다). 동시에 여러 창구에서 접수하듯
+    병렬로 요청하면, 가장 느린 요청 하나만큼만 기다리면 되어 전체
+    대기 시간이 크게 줄어듭니다.
     """
+    needed = _needed_reports(quarters)
     cache = {}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(len(needed), 1)) as executor:
+        future_to_key = {
+            executor.submit(
+                get_financial_data, corp_code, str(year), REPRT_CODES[label]
+            ): (year, label)
+            for year, label in needed
+        }
+        for future in concurrent.futures.as_completed(future_to_key):
+            key = future_to_key[future]
+            try:
+                cache[key] = future.result()
+            except Exception as e:  # 네트워크 예외 등 예상 못한 오류도 안전하게 처리
+                cache[key] = {"오류": f"요청 중 오류가 발생했습니다: {e}"}
+
     values = {}
     errors = {}
     for year, quarter in quarters:

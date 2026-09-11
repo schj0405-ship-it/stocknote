@@ -1,4 +1,5 @@
 import time
+import concurrent.futures
 
 import requests
 import pandas as pd
@@ -97,6 +98,7 @@ def find_stock_code(company_name):
     return str(stock_code).strip().zfill(6)
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
 def get_financial_data(corp_code, bsns_year, reprt_code, fs_div="CFS"):
     """
     OpenDART '단일회사 전체 재무제표' API를 호출해서
@@ -200,6 +202,7 @@ def get_financial_data(corp_code, bsns_year, reprt_code, fs_div="CFS"):
     return result
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
 def get_shares_outstanding(corp_code, bsns_year, reprt_code):
     """
     OpenDART '주식의 총수 현황' API로 보통주 유통주식수를 가져옵니다.
@@ -246,20 +249,35 @@ def get_per(corp_code, stock_code, bsns_year, reprt_code):
     주의: 사업보고서(연간)가 아닌 분기·반기를 선택하면 지배주주순이익이
     "그 기간까지의 누적" 금액이라, 1년 치가 아니라서 PER이 실제보다
     크게 나올 수 있습니다. PER은 사업보고서(연간) 기준으로 보시는 걸 권장합니다.
+
+    재무데이터·유통주식수·현재가는 서로 다른 서버(OpenDART, 네이버 금융)에
+    독립적으로 요청하는 것들이라, 하나씩 순서대로 기다리지 않고 동시에
+    요청을 보내서(병렬 처리) 전체 대기 시간을 줄입니다. (셋 중 가장
+    느린 응답 하나만큼만 기다리면 되므로, 순서대로 하나씩 기다릴 때보다
+    최대 3배 가까이 빨라집니다.)
     """
-    financial = get_financial_data(corp_code, bsns_year, reprt_code)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        financial_future = executor.submit(
+            get_financial_data, corp_code, bsns_year, reprt_code
+        )
+        shares_future = executor.submit(
+            get_shares_outstanding, corp_code, bsns_year, reprt_code
+        )
+        price_future = (
+            executor.submit(get_current_price, stock_code) if stock_code else None
+        )
+
+        financial = financial_future.result()
+        shares = shares_future.result()
+        price = price_future.result() if price_future is not None else None
+
     if "오류" in financial:
         return financial
 
     result = dict(financial)
-    result["현재가"] = None
-    result["유통주식수"] = None
+    result["현재가"] = price
+    result["유통주식수"] = shares
     result["PER"] = None
-
-    if stock_code:
-        result["현재가"] = get_current_price(stock_code)
-
-    result["유통주식수"] = get_shares_outstanding(corp_code, bsns_year, reprt_code)
 
     net_income = financial.get("지배주주순이익")
     price = result["현재가"]

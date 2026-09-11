@@ -11,8 +11,10 @@ from io import StringIO
 
 import pandas as pd
 import requests
+import streamlit as st
 
 
+@st.cache_data(ttl=300, show_spinner=False)
 def get_current_price(stock_code):
     """
     네이버 금융의 '일별 시세' 페이지에서 가장 최근 종가(직전 거래일 마감 가격)를
