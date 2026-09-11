@@ -1,4 +1,6 @@
 import time
+import random
+import threading
 import concurrent.futures
 
 import requests
@@ -16,22 +18,62 @@ DART_API_KEY = st.secrets["DART_API_KEY"]
 # 안 줄 때 화면이 "조회중" 상태로 영원히 멈춰버립니다.)
 REQUEST_TIMEOUT = 15
 
-# Streamlit Community Cloud는 미국에서만 앱을 실행하는데, 그러다 보니
-# 물리적으로 먼 한국 서버(OpenDART)로 나가는 요청이 가끔 유독 늦게 오거나
-# 아예 응답이 안 오는 경우가 있습니다(Streamlit 쪽 커뮤니티에도 같은 증상이
-# 보고돼 있음). 그래서 한 번 실패하면 잠깐 쉬었다가 한 번 더 시도합니다.
-REQUEST_RETRIES = 2
+# 한 번 실패하면 바로 포기하지 않고 몇 번 더 시도합니다. 매번 같은 간격이
+# 아니라 조금씩 더 오래 쉬면서(0.5초→1초→1.5초 + 약간의 무작위 시간) 다시
+# 시도합니다 - 서버가 일시적으로 바빠서 못 받아준 거라면, 똑같은 간격으로
+# 계속 두드리는 것보다 이렇게 하는 게 더 잘 통하는 경우가 많습니다.
+REQUEST_RETRIES = 3
+
+# "여러 분기 비교" 화면은 최대 8개 분기까지 볼 수 있는데, 그러면 필요한
+# 보고서를 여러 개(많으면 6~8개) 동시에 받아오려고 시도합니다. 문제는
+# OpenDART 이용약관(제10조)에 "이용횟수에 허용량 제한이 있고, 과도한
+# 접속은 서비스가 제한될 수 있다"고 명시돼 있는 점입니다. 실제로 지금
+# 자주 실패하는 원인도, 코드가 한꺼번에 여러 요청을 동시에 쏘는 게
+# OpenDART 입장에서 "과도한 접속"으로 보였을 가능성이 가장 큽니다
+# (스크린샷에서 여러 분기가 정확히 같은 시각에 전부 실패한 게 그 정황입니다).
+# 그래서 스레드는 여러 개를 띄우더라도, 실제로 OpenDART 서버에 동시에
+# 나가는 요청 개수는 이 값(2개)을 절대 넘지 않도록 전역으로 막아둡니다.
+# (창구가 2개뿐인 은행에 사람이 아무리 많이 줄 서도, 실제 처리는 2명씩만
+# 되는 것과 같은 원리입니다.) 이렇게 해도 OpenDART 쪽 사정으로 여전히
+# 가끔 실패할 수는 있어서, 100% 해결을 보장하는 건 아닙니다.
+_OPENDART_CONCURRENCY_LIMIT = 2
+_opendart_semaphore = threading.BoundedSemaphore(_OPENDART_CONCURRENCY_LIMIT)
+
+# 기본 requests 라이브러리는 "python-requests/2.x"라는 정체를 그대로
+# 드러내는 User-Agent(어떤 프로그램이 접속했는지 서버에 알려주는 정보)를
+# 보내는데, 일부 서버는 이런 값을 사람이 아닌 프로그램(봇)의 요청으로
+# 보고 더 엄격하게 걸러내기도 합니다. 실제 웹 브라우저가 보내는 값과
+# 비슷하게 맞춰서, 이런 이유로 막힐 가능성을 줄입니다.
+_SESSION = requests.Session()
+_SESSION.headers.update(
+    {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json",
+    }
+)
 
 
-def _request_with_retry(url, params):
+def _request_json_with_retry(url, params):
+    """
+    OpenDART에 요청을 보내고 JSON으로 바꿔서 돌려줍니다.
+    - 동시에 실제로 나가는 요청은 _opendart_semaphore가 최대 2개로 막아줍니다.
+    - 연결 실패·시간 초과뿐 아니라, 응답이 왔는데 JSON으로 못 바꾸는 경우
+      (서버가 불안정할 때 가끔 깨진 응답을 줄 수 있음)도 같은 방식으로
+      재시도합니다.
+    """
     last_error = None
     for attempt in range(REQUEST_RETRIES):
-        try:
-            return requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-        except requests.exceptions.RequestException as e:
-            last_error = e
-            if attempt < REQUEST_RETRIES - 1:
-                time.sleep(1)
+        with _opendart_semaphore:
+            try:
+                response = _SESSION.get(url, params=params, timeout=REQUEST_TIMEOUT)
+                return response.json()
+            except (requests.exceptions.RequestException, ValueError) as e:
+                last_error = e
+        if attempt < REQUEST_RETRIES - 1:
+            time.sleep(0.5 * (attempt + 1) + random.uniform(0, 0.5))
     raise last_error
 
 # 분기(보고서) 코드 - OpenDART가 정해놓은 규칙
@@ -120,12 +162,12 @@ def get_financial_data(corp_code, bsns_year, reprt_code, fs_div="CFS"):
     }
 
     try:
-        response = _request_with_retry(url, params)
-        data = response.json()
-    except requests.exceptions.RequestException:
-        # OpenDART 서버에 연결이 안 되거나(네트워크 문제), 응답이 너무 늦는 경우입니다.
-        # 재시도까지 했는데도 안 되면, 배포 서버와 OpenDART 사이 네트워크가
-        # 일시적으로 불안정한 상태일 가능성이 큽니다.
+        data = _request_json_with_retry(url, params)
+    except (requests.exceptions.RequestException, ValueError):
+        # OpenDART 서버에 연결이 안 되거나(네트워크 문제), 응답이 너무 늦거나,
+        # 응답이 깨져서 못 읽는 경우입니다. 재시도까지 했는데도 안 되면,
+        # 배포 서버와 OpenDART 사이 네트워크가 일시적으로 불안정하거나,
+        # 짧은 시간에 요청이 몰려서 OpenDART가 거부했을 가능성이 큽니다.
         return {"오류": "OpenDART 서버 응답이 오지 않습니다. 잠시 후 다시 시도해주세요."}
 
     # status가 "000"이 아니면 정상 응답이 아니라는 뜻
@@ -218,9 +260,8 @@ def get_shares_outstanding(corp_code, bsns_year, reprt_code):
     }
 
     try:
-        response = _request_with_retry(url, params)
-        data = response.json()
-    except requests.exceptions.RequestException:
+        data = _request_json_with_retry(url, params)
+    except (requests.exceptions.RequestException, ValueError):
         # 여기서 실패해도 재무데이터(매출액 등)는 이미 받아온 뒤라,
         # 유통주식수·PER만 "정보 없음"으로 비워두고 나머지는 정상적으로 보여줍니다.
         return None

@@ -168,7 +168,13 @@ def build_comparison_data(corp_code, quarters):
     needed = _needed_reports(quarters)
     cache = {}
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(len(needed), 1)) as executor:
+    # 스레드는 필요한 보고서 개수만큼 띄우지만, get_financial_data.py 안의
+    # _opendart_semaphore가 실제로 OpenDART에 동시에 나가는 요청은 최대
+    # 2개로 다시 한번 막아줍니다. 여기서 스레드 개수 자체도 너무 많이
+    # 띄우지 않도록 4개로 제한합니다(분기 8개를 비교해도 스레드가 8개까지
+    # 한꺼번에 대기 상태로 쌓이지 않게 하려는 것으로, 속도에는 영향이
+    # 거의 없습니다).
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(max(len(needed), 1), 4)) as executor:
         future_to_key = {
             executor.submit(
                 get_financial_data, corp_code, str(year), REPRT_CODES[label]

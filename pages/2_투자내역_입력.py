@@ -216,6 +216,36 @@ def delete_all_trades():
     supabase.table("trades").delete().eq("user_id", user.id).execute()
 
 
+def delete_one_trade(trade_id):
+    """
+    번호 하나만 골라서 그 줄만 딱 삭제합니다(표 전체를 다시 저장하지 않습니다).
+    trade_id는 화면의 "번호"(1,2,3...)가 아니라, Supabase가 각 줄마다 매겨둔
+    고유번호(id)입니다 - 화면 번호는 삭제하면 매번 다시 매겨지지만, id는
+    한 줄을 정확히 지목하기 위해 절대 안 바뀌는 값이라 이걸 기준으로 지웁니다.
+    """
+    _save_undo_snapshot("한 줄 삭제")
+    supabase.table("trades").delete().eq("user_id", user.id).eq("id", trade_id).execute()
+
+
+def load_trades_for_delete():
+    """
+    "한 줄만 골라서 삭제" 목록에 쓸, 가벼운 조회입니다. 위 load_trades()와
+    똑같이 id 오름차순(가장 먼저 저장한 순서)으로 정렬해서, 화면 번호가
+    위쪽 "저장된 투자내역" 표의 번호와 항상 똑같이 맞도록 합니다.
+    """
+    response = (
+        supabase.table("trades")
+        .select("id, stock_name, buy_date, sell_date, quantity, sell_quantity")
+        .eq("user_id", user.id)
+        .order("id", desc=False)
+        .execute()
+    )
+    rows = response.data or []
+    for i, row in enumerate(rows, start=1):
+        row[DISPLAY_NO_COL] = i
+    return rows
+
+
 def replace_all_trades(df):
     """
     표에서 수정한 내용을 전부 반영합니다.
@@ -480,6 +510,56 @@ else:
             st.rerun()
 
     # ------------------------------------------------------------------
+    # 한 줄만 골라서 삭제: 위 표에서 행을 선택하고 작은 휴지통 아이콘을 누른 뒤
+    # "변경사항 저장"을 누르는 방식은 아이콘이 작아서 찾기 어렵다는 의견이
+    # 있어서, 줄마다 알아보기 쉬운 크기의 "삭제" 버튼을 따로 만들었습니다.
+    # 이 버튼은 누르는 즉시 그 줄만 지워지고(표 전체를 다시 저장할 필요 없음),
+    # 위의 "되돌리기"로 바로 복구할 수도 있습니다.
+    # ------------------------------------------------------------------
+    st.divider()
+    st.subheader("🗑️ 한 줄만 골라서 삭제")
+    st.caption("표를 고치고 '변경사항 저장'을 누르지 않아도, 이 줄의 [삭제] 버튼만 누르면 그 줄 하나만 바로 지워집니다.")
+
+    delete_rows = load_trades_for_delete()
+    if not delete_rows:
+        st.caption("삭제할 내역이 없습니다.")
+    else:
+        col_widths = [0.7, 2.2, 1.4, 1.4, 1.3, 1.3, 1.1]
+        header_cols = st.columns(col_widths)
+        for col, label in zip(
+            header_cols, ["번호", "종목명", "매수일", "매도일", "매입수량", "매도수량", ""]
+        ):
+            if label:
+                col.markdown(f"**{label}**")
+
+        for row in delete_rows:
+            row_cols = st.columns(col_widths)
+            row_cols[0].write(row[DISPLAY_NO_COL])
+            row_cols[1].write(row.get("stock_name") or "")
+            row_cols[2].write(row.get("buy_date") or "-")
+            row_cols[3].write(row.get("sell_date") or "-")
+            row_cols[4].write(row.get("quantity") or 0)
+            row_cols[5].write(row.get("sell_quantity") or 0)
+            try:
+                # 최신 Streamlit은 width="stretch"를 씁니다(칸 너비만큼 버튼을 꽉 채워
+                # 더 눈에 잘 띄게 만듭니다).
+                clicked = row_cols[6].button(
+                    "삭제", key=f"delete_one_{row['id']}", type="primary", width="stretch"
+                )
+            except TypeError:
+                # 배포 서버의 Streamlit 버전이 예전 것이면 옛날 옵션으로 대신 시도합니다.
+                clicked = row_cols[6].button(
+                    "삭제",
+                    key=f"delete_one_{row['id']}",
+                    type="primary",
+                    use_container_width=True,
+                )
+            if clicked:
+                delete_one_trade(row["id"])
+                st.success(f"{row.get('stock_name')} ({row[DISPLAY_NO_COL]}번) 줄이 삭제되었습니다.")
+                st.rerun()
+
+    # ------------------------------------------------------------------
     # 손익 분석: 매도까지 끝난 내역만 모아서 연도별·연도월별로 손익을 집계합니다.
     # ------------------------------------------------------------------
     st.divider()
@@ -539,6 +619,21 @@ else:
         "직전 거래일 종가일 수 있습니다). 종목코드를 입력하지 않은 종목은 현재가를 가져올 수 없습니다."
     )
 
+    # 매도 경고등(손절 알림): 평균 매입가보다 현재가가 이 비율(%) 이상 떨어지면
+    # 아래 표에서 그 종목 줄을 빨간색으로 표시합니다. 몇 %부터 경고할지는
+    # 사람마다 투자 스타일이 달라서, 숫자를 직접 정할 수 있게 만들었습니다.
+    # (지금 로그인한 브라우저 화면에서만 기억되고, 새로고침하거나 나중에
+    # 다시 접속하면 기본값 10%로 돌아갑니다.)
+    stop_loss_pct = st.number_input(
+        "🔴 매도 경고 기준 (평균 매입가 대비 하락률, %)",
+        min_value=1,
+        max_value=90,
+        value=st.session_state.get("stop_loss_pct", 10),
+        step=1,
+        key="stop_loss_pct",
+        help="예: 10을 넣으면, 평균 매입가보다 10% 이상 떨어진 보유 종목이 아래 표에서 빨간색으로 표시됩니다.",
+    )
+
     holdings = build_holdings(trades_df)
 
     if holdings.empty:
@@ -546,6 +641,20 @@ else:
     else:
         with st.spinner("현재가를 불러오는 중입니다..."):
             holdings = attach_current_prices(holdings)
+
+        # 하락률(%) = (평균매입가 - 현재가) / 평균매입가 × 100
+        # 현재가를 못 가져온 종목은 계산할 수 없어서 경고 대상에서 제외합니다.
+        def _calc_drop_pct(row):
+            price = row["현재가"]
+            avg_price = row["평균매입가"]
+            if pd.isna(price) or not avg_price:
+                return None
+            return (avg_price - price) / avg_price * 100
+
+        holdings["하락률(%)"] = holdings.apply(_calc_drop_pct, axis=1)
+        holdings["매도경고"] = holdings["하락률(%)"].apply(
+            lambda v: bool(v is not None and v >= stop_loss_pct)
+        )
 
         total_cost = holdings["매입금액"].sum()
         has_price = holdings["평가금액"].notna().any()
@@ -564,9 +673,19 @@ else:
         else:
             col_b.metric("총 평가금액", "정보 없음")
 
-        display_holdings = holdings.drop(columns=["조회용_종목코드", "이름으로_자동조회"]).rename(
-            columns={"stock_name": "종목명", "stock_code": "종목코드"}
-        )
+        # 표에 보여줄 "경고" 글자 칸(체크박스 대신 눈에 바로 들어오는 문구로 표시)
+        holdings["경고"] = holdings["매도경고"].apply(lambda flagged: "🔴 매도 경고" if flagged else "")
+
+        display_holdings = holdings.drop(
+            columns=["조회용_종목코드", "이름으로_자동조회", "매도경고"]
+        ).rename(columns={"stock_name": "종목명", "stock_code": "종목코드"})
+
+        def _highlight_warning_row(row):
+            """'경고' 칸이 켜진 줄 전체를 빨간색 배경으로 칠해서 경고등처럼 보이게 합니다."""
+            if row["경고"]:
+                return ["background-color: rgba(239, 68, 68, 0.18)"] * len(row)
+            return [""] * len(row)
+
         styled_holdings = display_holdings.style.format(
             {
                 "보유수량": "{:,.0f}",
@@ -575,10 +694,20 @@ else:
                 "현재가": lambda v: "정보 없음" if pd.isna(v) else f"{v:,.0f}원",
                 "평가금액": lambda v: "정보 없음" if pd.isna(v) else f"{v:,.0f}원",
                 "평가손익": lambda v: "-" if pd.isna(v) else f"{v:,.0f}원",
+                "하락률(%)": lambda v: "-" if pd.isna(v) else f"{v:.1f}%",
             }
         )
+        styled_holdings = styled_holdings.apply(_highlight_warning_row, axis=1)
         styled_holdings = _apply_profit_style(styled_holdings, ["평가손익"])
         st.dataframe(styled_holdings, hide_index=True, width="stretch")
+
+        warned = holdings[holdings["매도경고"]]
+        if not warned.empty:
+            warned_names = ", ".join(warned["stock_name"].tolist())
+            st.error(
+                f"🔴 매도 경고: {warned_names} 종목이 평균 매입가 대비 {stop_loss_pct}% 이상 "
+                "하락했습니다. 손절 여부를 검토해보세요."
+            )
 
         auto_matched = holdings[holdings["이름으로_자동조회"] & holdings["조회용_종목코드"].astype(bool)]
         if not auto_matched.empty:
