@@ -5,6 +5,7 @@ import pandas as pd
 import streamlit as st
 
 from auth import get_supabase_client, require_login
+from get_financial_data import find_stock_code
 from stock_price import get_current_price
 
 st.set_page_config(page_title="스톡노트 - 투자내역", layout="wide")
@@ -175,6 +176,46 @@ def _clean(value, default=None):
     return value
 
 
+def _fetch_raw_trades():
+    """
+    지금 DB에 실제로 저장돼 있는 내용을 가공하지 않고 그대로 가져옵니다.
+    "되돌리기" 기능에서 지우기 직전 상태를 백업해두는 용도로 씁니다.
+    """
+    response = supabase.table("trades").select("*").eq("user_id", user.id).execute()
+    return response.data or []
+
+
+def _save_undo_snapshot(action_label):
+    """
+    데이터를 지우기 직전에 호출해서, 지금 상태를 세션에 잠깐 기억해둡니다.
+    (브라우저 탭을 닫거나 다른 페이지로 갔다 오면 사라집니다 - 실수로 저장/삭제한
+    바로 다음에 되돌리는 용도입니다.)
+    """
+    st.session_state["undo_snapshot"] = _fetch_raw_trades()
+    st.session_state["undo_label"] = action_label
+
+
+def restore_undo_snapshot():
+    """세션에 저장해둔 되돌리기 백업으로 복원합니다."""
+    snapshot = st.session_state.get("undo_snapshot")
+    if snapshot is None:
+        return False
+    supabase.table("trades").delete().eq("user_id", user.id).execute()
+    # id는 DB가 새로 자동으로 매기게 두고, 나머지 값만 그대로 복원합니다.
+    records = [{k: v for k, v in row.items() if k != "id"} for row in snapshot]
+    if records:
+        supabase.table("trades").insert(records).execute()
+    st.session_state["undo_snapshot"] = None
+    st.session_state["undo_label"] = None
+    return True
+
+
+def delete_all_trades():
+    """로그인한 사용자 본인의 투자내역을 전부 삭제합니다(되돌리기용 백업을 먼저 남깁니다)."""
+    _save_undo_snapshot("전체 삭제")
+    supabase.table("trades").delete().eq("user_id", user.id).execute()
+
+
 def replace_all_trades(df):
     """
     표에서 수정한 내용을 전부 반영합니다.
@@ -220,6 +261,9 @@ def replace_all_trades(df):
         }
         records.extend(split_by_sell_quantity(base_record))
 
+    # 검증을 다 통과했을 때만, 지우기 직전 상태를 되돌리기용으로 남겨둡니다.
+    _save_undo_snapshot("변경사항 저장 (표 수정)")
+
     supabase.table("trades").delete().eq("user_id", user.id).execute()
     if records:
         supabase.table("trades").insert(records).execute()
@@ -246,6 +290,26 @@ def build_holdings(df):
     return grouped
 
 
+def _resolve_lookup_code(stock_name, stock_code):
+    """
+    종목코드 칸을 비워두고 저장한 경우, 현재가를 아예 못 가져오는 문제가
+    있었습니다. 종목코드가 비어 있으면 재무데이터 조회 화면에서 쓰는
+    corp_codes.csv(상장사 목록)에서 종목명으로 종목코드를 대신 찾아봅니다
+    (get_financial_data.py의 find_stock_code 함수를 그대로 가져다 씀).
+    이름이 정확히 일치하는 회사가 없으면 이름이 포함된 회사를 찾는데,
+    이 경우 다른 회사가 잘못 걸릴 수도 있어서 화면에 "이름으로 자동 조회함"
+    이라고 표시해 사용자가 확인할 수 있게 합니다.
+    """
+    code = str(stock_code or "").strip()
+    if code:
+        return code, False
+    try:
+        resolved = find_stock_code(stock_name)
+    except Exception:
+        resolved = None
+    return (resolved, True) if resolved else ("", False)
+
+
 def attach_current_prices(grouped):
     """
     보유 중인 종목들의 현재가를 네이버 금융에서 가져와 붙입니다.
@@ -253,7 +317,14 @@ def attach_current_prices(grouped):
     없애고, 여러 종목의 현재가를 동시에(병렬로) 가져와서 기다리는 시간을
     줄입니다.
     """
-    codes = sorted({str(c).zfill(6) for c in grouped["stock_code"] if c})
+    grouped = grouped.copy()
+    resolved = grouped.apply(
+        lambda r: _resolve_lookup_code(r["stock_name"], r["stock_code"]), axis=1
+    )
+    grouped["조회용_종목코드"] = [r[0] for r in resolved]
+    grouped["이름으로_자동조회"] = [r[1] for r in resolved]
+
+    codes = sorted({str(c).zfill(6) for c in grouped["조회용_종목코드"] if c})
     price_map = {}
     if codes:
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(codes), 8)) as executor:
@@ -264,8 +335,7 @@ def attach_current_prices(grouped):
             return None
         return price_map.get(str(code).zfill(6))
 
-    grouped = grouped.copy()
-    grouped["현재가"] = grouped["stock_code"].apply(_lookup)
+    grouped["현재가"] = grouped["조회용_종목코드"].apply(_lookup)
     grouped["평가금액"] = grouped["보유수량"] * grouped["현재가"]
     grouped["평가손익"] = grouped["평가금액"] - grouped["매입금액"]
     return grouped
@@ -378,13 +448,36 @@ else:
         },
     )
 
-    if st.button("변경사항 저장", type="primary"):
-        success, error_msg = replace_all_trades(edited_df)
-        if success:
-            st.success("수정 내용이 저장되었습니다.")
+    col_save, col_delete_all = st.columns([1, 1])
+
+    with col_save:
+        if st.button("변경사항 저장", type="primary"):
+            success, error_msg = replace_all_trades(edited_df)
+            if success:
+                st.success("수정 내용이 저장되었습니다.")
+                st.rerun()
+            else:
+                st.error(error_msg)
+
+    with col_delete_all:
+        with st.popover("🗑️ 전체 삭제"):
+            st.warning(
+                "내 투자내역을 전부 삭제합니다. 삭제 직후에는 아래 '되돌리기'로 복구할 수 "
+                "있지만, 그 뒤에 다른 저장을 하면 더는 복구할 수 없습니다."
+            )
+            confirm_delete_all = st.checkbox("정말로 전체 삭제하겠습니다", key="confirm_delete_all")
+            if st.button("전체 삭제 실행", disabled=not confirm_delete_all):
+                delete_all_trades()
+                st.session_state.pop("confirm_delete_all", None)
+                st.success("전체 삭제되었습니다.")
+                st.rerun()
+
+    if st.session_state.get("undo_snapshot") is not None:
+        st.info(f"직전 작업: {st.session_state.get('undo_label', '')}. 잘못하셨다면 바로 되돌릴 수 있습니다.")
+        if st.button("↩️ 바로 직전 상태로 되돌리기"):
+            restore_undo_snapshot()
+            st.success("직전 상태로 되돌렸습니다.")
             st.rerun()
-        else:
-            st.error(error_msg)
 
     # ------------------------------------------------------------------
     # 손익 분석: 매도까지 끝난 내역만 모아서 연도별·연도월별로 손익을 집계합니다.
@@ -471,7 +564,9 @@ else:
         else:
             col_b.metric("총 평가금액", "정보 없음")
 
-        display_holdings = holdings.rename(columns={"stock_name": "종목명", "stock_code": "종목코드"})
+        display_holdings = holdings.drop(columns=["조회용_종목코드", "이름으로_자동조회"]).rename(
+            columns={"stock_name": "종목명", "stock_code": "종목코드"}
+        )
         styled_holdings = display_holdings.style.format(
             {
                 "보유수량": "{:,.0f}",
@@ -484,6 +579,17 @@ else:
         )
         styled_holdings = _apply_profit_style(styled_holdings, ["평가손익"])
         st.dataframe(styled_holdings, hide_index=True, width="stretch")
+
+        auto_matched = holdings[holdings["이름으로_자동조회"] & holdings["조회용_종목코드"].astype(bool)]
+        if not auto_matched.empty:
+            matched_text = ", ".join(
+                f"{row.stock_name}({row.조회용_종목코드})" for row in auto_matched.itertuples()
+            )
+            st.caption(
+                "종목코드를 입력하지 않아서, 이름으로 자동 조회한 종목코드로 현재가를 가져왔습니다: "
+                f"{matched_text}. 이름이 비슷한 다른 회사가 잘못 걸렸을 수 있으니, 정확하게 하려면 "
+                "위 표(저장된 투자내역)에서 종목코드를 직접 입력해주세요."
+            )
 
         missing = holdings[holdings["현재가"].isna()]
         if not missing.empty:
