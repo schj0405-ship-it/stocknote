@@ -1,9 +1,11 @@
+import concurrent.futures
 from datetime import date
 
 import pandas as pd
 import streamlit as st
 
 from auth import get_supabase_client, require_login
+from stock_price import get_current_price
 
 st.set_page_config(page_title="스톡노트 - 투자내역", layout="wide")
 st.title("투자내역 입력")
@@ -25,13 +27,32 @@ PROFIT_COLOR = "#15803d"
 LOSS_COLOR = "#b91c1c"
 
 
+def _style_profit_cell(value):
+    """양수(이익)는 초록, 음수(손실)는 빨강 글자로 칠해주는 함수. 여러 표에서 재사용합니다."""
+    if pd.isna(value):
+        return ""
+    if value > 0:
+        return f"color: {PROFIT_COLOR}; font-weight: 700"
+    if value < 0:
+        return f"color: {LOSS_COLOR}; font-weight: 700"
+    return ""
+
+
+def _apply_profit_style(styler, subset):
+    # pandas 2.1부터는 applymap 대신 map을 쓰라고 권장하는데, 배포 서버의
+    # pandas 버전이 정확히 몇인지 고정돼 있지 않아서 둘 다 지원하도록 처리합니다.
+    if hasattr(styler, "map"):
+        return styler.map(_style_profit_cell, subset=subset)
+    return styler.applymap(_style_profit_cell, subset=subset)
+
+
 def load_trades():
     """로그인한 사용자 본인의 투자내역만 불러옵니다."""
     response = (
         supabase.table("trades")
         .select("*")
         .eq("user_id", user.id)
-        .order("id", desc=False)  # 오래된 순으로 받아와서 번호를 매긴 뒤, 화면에는 최신순으로 뒤집어 보여줍니다.
+        .order("id", desc=False)  # 가장 먼저 저장한 것부터 순서대로 받아옵니다.
         .execute()
     )
     df = pd.DataFrame(response.data)
@@ -50,22 +71,33 @@ def load_trades():
     df[DISPLAY_NO_COL] = range(1, len(df) + 1)
     df = df.drop(columns=["id"])
 
-    # 매도가가 0보다 큰(=실제로 매도까지 끝난) 행만 손익을 계산합니다.
-    # 손익 = (매도가 - 매수가) × 수량 - 수수료 - 세금
+    # sell_quantity(매도수량) 칸은 새로 추가된 것이라, Supabase에 아직
+    # 이 칸을 추가하는 SQL을 실행하지 않았다면 응답에 이 칸 자체가 없을 수
+    # 있습니다. 그런 경우에도 화면이 에러 없이 뜨도록, 예전 방식(매도가가
+    # 있으면 산 만큼 전부 팔았다고 가정)으로 임시로 채워 넣습니다.
+    # (다만 실제로 저장하려면 반드시 SQL을 먼저 실행해야 합니다 - 안내 문구 참고)
+    if "sell_quantity" not in df.columns:
+        df["sell_quantity"] = df.apply(
+            lambda r: r.get("quantity", 0) if (r.get("sell_price") or 0) > 0 else 0,
+            axis=1,
+        )
+    else:
+        df["sell_quantity"] = df["sell_quantity"].fillna(0)
+
+    # 매도수량이 0보다 큰(=조금이라도 매도한) 행만 손익을 계산합니다.
+    # 손익 = (매도가 - 매수가) × 매도수량 - 수수료 - 세금
+    # (매도수량이 아니라 매입수량으로 계산하면, 일부만 판 경우 손익이 부풀려집니다.)
     def _row_profit(row):
         sell_price = row.get("sell_price") or 0
-        if sell_price > 0:
+        sell_quantity = row.get("sell_quantity") or 0
+        if sell_price > 0 and sell_quantity > 0:
             buy_price = row.get("buy_price") or 0
-            quantity = row.get("quantity") or 0
             fee = row.get("fee") or 0
             tax = row.get("tax") or 0
-            return (sell_price - buy_price) * quantity - fee - tax
+            return (sell_price - buy_price) * sell_quantity - fee - tax
         return None
 
     df[PROFIT_COL] = df.apply(_row_profit, axis=1)
-
-    # 최근에 입력한 내용이 표 맨 위에 오도록 순서를 뒤집습니다(번호 자체는 그대로 유지됩니다).
-    df = df.iloc[::-1].reset_index(drop=True)
 
     column_order = [
         DISPLAY_NO_COL,
@@ -76,6 +108,7 @@ def load_trades():
         "quantity",
         "sell_date",
         "sell_price",
+        "sell_quantity",
         "fee",
         "tax",
         PROFIT_COL,
@@ -83,6 +116,45 @@ def load_trades():
         "result_tag",
     ]
     return df[column_order]
+
+
+def split_by_sell_quantity(record):
+    """
+    한 번에 산 주식을 전부 다 팔지 않고 일부만 팔았을 때(부분매도), 한 줄로
+    남겨두면 "매입수량"과 "매도수량"이 서로 달라서 헷갈리기 때문에 이 함수가
+    두 줄로 나눠줍니다.
+
+    1) "판 부분": 매입수량을 실제로 판 수량(매도수량)만큼으로 줄이고,
+       매도 정보(매도일·매도가·수수료·세금)를 그대로 채운, 매매가 끝난 기록
+    2) "안 판 부분": 남은 수량(매입수량-매도수량)만 매입수량으로 가지고,
+       매도 정보는 전부 비운 채 계속 보유 중인 것으로 남는 새 기록
+
+    매도수량이 0이면(아직 하나도 안 팜) 그대로 한 줄만 돌려줍니다.
+    매도수량이 매입수량과 같거나 더 크면(전부 다 팔았거나, 잘못 입력된 값)
+    쪼갤 필요가 없어서 한 줄만 돌려줍니다(매도수량이 더 큰 잘못된 값은
+    호출하는 쪽에서 미리 걸러냅니다).
+    """
+    quantity = record.get("quantity") or 0
+    sell_quantity = record.get("sell_quantity") or 0
+
+    if sell_quantity <= 0 or sell_quantity >= quantity:
+        return [record]
+
+    sold_part = dict(record)
+    sold_part["quantity"] = sell_quantity
+    sold_part["sell_quantity"] = sell_quantity
+
+    remaining_part = dict(record)
+    remaining_part["quantity"] = quantity - sell_quantity
+    remaining_part["sell_quantity"] = 0
+    remaining_part["sell_date"] = None
+    remaining_part["sell_price"] = 0.0
+    remaining_part["fee"] = 0.0
+    remaining_part["tax"] = 0.0
+    remaining_part["memo"] = ""
+    remaining_part["result_tag"] = "보류"
+
+    return [sold_part, remaining_part]
 
 
 def insert_trade(row):
@@ -110,34 +182,93 @@ def replace_all_trades(df):
     (행을 수정하거나, 새 행을 추가하거나, 행을 삭제한 것 모두 이 방식으로 한 번에 반영됩니다).
     다른 사용자의 데이터는 건드리지 않습니다.
     "번호"·"손익" 칸은 화면에서만 보여주려고 계산한 값이라 저장 대상에서 제외합니다.
-    """
-    supabase.table("trades").delete().eq("user_id", user.id).execute()
+    부분매도(매도수량 < 매입수량)가 있는 행은 split_by_sell_quantity로 두 줄로 나눠 저장합니다.
 
+    반환값: (성공 여부, 오류 메시지 또는 None)
+    매도수량이 매입수량보다 큰 것처럼 잘못된 값이 하나라도 있으면, 기존 데이터를
+    지우기 전에 먼저 전부 확인해서 아무것도 저장하지 않고 오류만 돌려줍니다
+    (검증에 실패했는데 기존 데이터부터 지워버리면 안 되기 때문입니다).
+    """
     records = []
     for _, row in df.iterrows():
         stock_name = str(_clean(row.get("stock_name"), "")).strip()
         if not stock_name:
             continue  # 종목명이 빈 줄은 저장하지 않습니다.
 
-        records.append(
-            {
-                "user_id": user.id,
-                "stock_name": stock_name,
-                "stock_code": str(_clean(row.get("stock_code"), "")),
-                "buy_date": str(_clean(row.get("buy_date"))) if _clean(row.get("buy_date")) else None,
-                "buy_price": float(_clean(row.get("buy_price"), 0)),
-                "quantity": int(_clean(row.get("quantity"), 0)),
-                "sell_date": str(_clean(row.get("sell_date"))) if _clean(row.get("sell_date")) else None,
-                "sell_price": float(_clean(row.get("sell_price"), 0)),
-                "fee": float(_clean(row.get("fee"), 0)),
-                "tax": float(_clean(row.get("tax"), 0)),
-                "memo": str(_clean(row.get("memo"), "")),
-                "result_tag": str(_clean(row.get("result_tag"), "")),
-            }
-        )
+        quantity = int(_clean(row.get("quantity"), 0))
+        sell_quantity = int(_clean(row.get("sell_quantity"), 0))
+        if sell_quantity > quantity:
+            return False, (
+                f"'{stock_name}' 행의 매도수량({sell_quantity})이 "
+                f"매입수량({quantity})보다 큽니다. 값을 확인해주세요."
+            )
 
+        base_record = {
+            "user_id": user.id,
+            "stock_name": stock_name,
+            "stock_code": str(_clean(row.get("stock_code"), "")),
+            "buy_date": str(_clean(row.get("buy_date"))) if _clean(row.get("buy_date")) else None,
+            "buy_price": float(_clean(row.get("buy_price"), 0)),
+            "quantity": quantity,
+            "sell_date": str(_clean(row.get("sell_date"))) if _clean(row.get("sell_date")) else None,
+            "sell_price": float(_clean(row.get("sell_price"), 0)),
+            "sell_quantity": sell_quantity,
+            "fee": float(_clean(row.get("fee"), 0)),
+            "tax": float(_clean(row.get("tax"), 0)),
+            "memo": str(_clean(row.get("memo"), "")),
+            "result_tag": str(_clean(row.get("result_tag"), "")),
+        }
+        records.extend(split_by_sell_quantity(base_record))
+
+    supabase.table("trades").delete().eq("user_id", user.id).execute()
     if records:
         supabase.table("trades").insert(records).execute()
+    return True, None
+
+
+def build_holdings(df):
+    """
+    표에 있는 내용 중 아직 다 팔지 않고 보유 중인 부분(매입수량-매도수량 > 0)만
+    종목별로 모아서, 보유수량·매입금액·평균매입가를 계산합니다.
+    """
+    work = df.copy()
+    work["보유수량"] = work["quantity"].fillna(0) - work["sell_quantity"].fillna(0)
+    work = work[work["보유수량"] > 0]
+    if work.empty:
+        return work
+
+    work["매입금액_부분"] = work["보유수량"] * work["buy_price"].fillna(0)
+
+    grouped = work.groupby(["stock_name", "stock_code"], as_index=False).agg(
+        보유수량=("보유수량", "sum"), 매입금액=("매입금액_부분", "sum")
+    )
+    grouped["평균매입가"] = grouped["매입금액"] / grouped["보유수량"]
+    return grouped
+
+
+def attach_current_prices(grouped):
+    """
+    보유 중인 종목들의 현재가를 네이버 금융에서 가져와 붙입니다.
+    같은 종목코드를 중복해서 요청하지 않도록 먼저 종목코드 목록의 중복을
+    없애고, 여러 종목의 현재가를 동시에(병렬로) 가져와서 기다리는 시간을
+    줄입니다.
+    """
+    codes = sorted({str(c).zfill(6) for c in grouped["stock_code"] if c})
+    price_map = {}
+    if codes:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(codes), 8)) as executor:
+            price_map = dict(zip(codes, executor.map(get_current_price, codes)))
+
+    def _lookup(code):
+        if not code:
+            return None
+        return price_map.get(str(code).zfill(6))
+
+    grouped = grouped.copy()
+    grouped["현재가"] = grouped["stock_code"].apply(_lookup)
+    grouped["평가금액"] = grouped["보유수량"] * grouped["현재가"]
+    grouped["평가손익"] = grouped["평가금액"] - grouped["매입금액"]
+    return grouped
 
 
 with st.form("trade_form", clear_on_submit=True):
@@ -148,42 +279,61 @@ with st.form("trade_form", clear_on_submit=True):
         stock_code = st.text_input("종목코드 (선택)")
         buy_date = st.date_input("매수일", value=date.today())
         buy_price = st.number_input("매수가", min_value=0.0, step=100.0)
-        quantity = st.number_input("수량", min_value=0, step=1)
+        quantity = st.number_input("매입수량", min_value=0, step=1)
 
     with col2:
         sell_date = st.date_input("매도일", value=date.today())
         sell_price = st.number_input("매도가", min_value=0.0, step=100.0)
+        sell_quantity = st.number_input("매도수량", min_value=0, step=1)
         fee = st.number_input("수수료", min_value=0.0, step=10.0)
         tax = st.number_input("세금", min_value=0.0, step=10.0)
         result_tag = st.selectbox("결과 태그", ["성공", "실패", "보류"])
 
+    st.caption(
+        "아직 팔지 않았다면 매도수량은 0으로 두세요. 전부 팔았다면 매입수량과 "
+        "같은 숫자를, 일부만 팔았다면 판 수량만 입력하세요 - 나머지는 자동으로 "
+        "별도 줄로 나뉘어 계속 보유 중인 것으로 남습니다."
+    )
     memo = st.text_area("투자결과 분석 메모")
     submitted = st.form_submit_button("저장")
 
 if submitted:
     if not stock_name.strip():
         st.error("종목명을 입력해주세요.")
+    elif sell_quantity > quantity:
+        st.error(f"매도수량({int(sell_quantity)})은 매입수량({int(quantity)})보다 클 수 없습니다.")
     else:
-        insert_trade(
-            {
-                "stock_name": stock_name.strip(),
-                "stock_code": stock_code.strip(),
-                "buy_date": str(buy_date),
-                "buy_price": buy_price,
-                "quantity": int(quantity),
-                "sell_date": str(sell_date),
-                "sell_price": sell_price,
-                "fee": fee,
-                "tax": tax,
-                "memo": memo,
-                "result_tag": result_tag,
-            }
-        )
-        st.success(f"{stock_name} 매매 기록이 저장되었습니다.")
+        base_record = {
+            "stock_name": stock_name.strip(),
+            "stock_code": stock_code.strip(),
+            "buy_date": str(buy_date),
+            "buy_price": buy_price,
+            "quantity": int(quantity),
+            "sell_date": str(sell_date),
+            "sell_price": sell_price,
+            "sell_quantity": int(sell_quantity),
+            "fee": fee,
+            "tax": tax,
+            "memo": memo,
+            "result_tag": result_tag,
+        }
+        parts = split_by_sell_quantity(base_record)
+        for part in parts:
+            insert_trade(part)
+
+        if len(parts) == 2:
+            st.success(
+                f"{stock_name} 매매 기록이 저장되었습니다. "
+                f"(판 {int(sell_quantity)}주 + 남은 {int(quantity - sell_quantity)}주, "
+                "두 줄로 나눠 저장했습니다.)"
+            )
+        else:
+            st.success(f"{stock_name} 매매 기록이 저장되었습니다.")
 
 st.subheader("저장된 투자내역")
 st.caption("표 안의 칸을 더블클릭하면 바로 수정할 수 있습니다. 행 왼쪽을 클릭해 선택한 뒤 휴지통 아이콘으로 삭제하거나, 표 맨 아래 빈 줄에 새로 입력해서 추가할 수도 있습니다.")
-st.caption("'손익' 칸은 매도가를 0보다 크게 입력하면 자동으로 계산됩니다((매도가-매수가)×수량-수수료-세금). 값을 고치고 '변경사항 저장'을 눌러야 다시 계산됩니다.")
+st.caption("가장 먼저 저장한 내용이 맨 위에 오도록 정렬되어 있고, 새로 추가한 줄은 맨 아래에 붙습니다.")
+st.caption("'손익' 칸은 매도수량을 0보다 크게 입력하면 자동으로 계산됩니다((매도가-매수가)×매도수량-수수료-세금). 값을 고치고 '변경사항 저장'을 눌러야 다시 계산됩니다.")
 
 trades_df = load_trades()
 
@@ -207,16 +357,21 @@ else:
             "stock_code": st.column_config.TextColumn("종목코드"),
             "buy_date": st.column_config.DateColumn("매수일"),
             "buy_price": st.column_config.NumberColumn("매수가", format="%,.0f"),
-            "quantity": st.column_config.NumberColumn("수량", format="%,d"),
+            "quantity": st.column_config.NumberColumn("매입수량", format="%,d"),
             "sell_date": st.column_config.DateColumn("매도일"),
             "sell_price": st.column_config.NumberColumn("매도가", format="%,.0f"),
+            "sell_quantity": st.column_config.NumberColumn(
+                "매도수량",
+                format="%,d",
+                help="일부만 팔았다면 판 수량만 입력하세요. '변경사항 저장'을 누르면 남은 수량은 자동으로 별도 줄로 나뉩니다.",
+            ),
             "fee": st.column_config.NumberColumn("수수료", format="%,.0f"),
             "tax": st.column_config.NumberColumn("세금", format="%,.0f"),
             PROFIT_COL: st.column_config.NumberColumn(
                 "손익",
                 disabled=True,
                 format="%,.0f",
-                help="매도가를 입력하면 자동으로 계산됩니다: (매도가-매수가)×수량-수수료-세금.",
+                help="매도수량을 입력하면 자동으로 계산됩니다: (매도가-매수가)×매도수량-수수료-세금.",
             ),
             "memo": st.column_config.TextColumn("투자결과 분석 메모"),
             "result_tag": st.column_config.SelectboxColumn("결과 태그", options=["성공", "실패", "보류"]),
@@ -224,9 +379,12 @@ else:
     )
 
     if st.button("변경사항 저장", type="primary"):
-        replace_all_trades(edited_df)
-        st.success("수정 내용이 저장되었습니다.")
-        st.rerun()
+        success, error_msg = replace_all_trades(edited_df)
+        if success:
+            st.success("수정 내용이 저장되었습니다.")
+            st.rerun()
+        else:
+            st.error(error_msg)
 
     # ------------------------------------------------------------------
     # 손익 분석: 매도까지 끝난 내역만 모아서 연도별·연도월별로 손익을 집계합니다.
@@ -237,9 +395,9 @@ else:
     sell_df = trades_df[trades_df[PROFIT_COL].notna()].copy()
 
     if sell_df.empty:
-        st.info("아직 매도까지 완료된 내역이 없어 손익 분석을 보여드릴 수 없습니다. 매도가를 입력하고 저장하면 여기에 집계됩니다.")
+        st.info("아직 매도까지 완료된 내역이 없어 손익 분석을 보여드릴 수 없습니다. 매도수량을 입력하고 저장하면 여기에 집계됩니다.")
     else:
-        st.caption("매도가가 0보다 큰(=매도까지 끝난) 내역만 집계합니다. 아직 보유 중인 종목은 제외됩니다.")
+        st.caption("매도수량이 0보다 큰(=조금이라도 매도한) 내역만 집계합니다.")
 
         total_profit = sell_df[PROFIT_COL].sum()
         total_color = PROFIT_COLOR if total_profit > 0 else (LOSS_COLOR if total_profit < 0 else "inherit")
@@ -251,22 +409,6 @@ else:
 
         sell_df["연도"] = pd.to_datetime(sell_df["sell_date"]).dt.year
         sell_df["월"] = pd.to_datetime(sell_df["sell_date"]).dt.month
-
-        def _style_profit_cell(value):
-            if pd.isna(value):
-                return ""
-            if value > 0:
-                return f"color: {PROFIT_COLOR}; font-weight: 700"
-            if value < 0:
-                return f"color: {LOSS_COLOR}; font-weight: 700"
-            return ""
-
-        def _apply_profit_style(styler, subset):
-            # pandas 2.1부터는 applymap 대신 map을 쓰라고 권장하는데, 배포 서버의
-            # pandas 버전이 정확히 몇인지 고정돼 있지 않아서 둘 다 지원하도록 처리합니다.
-            if hasattr(styler, "map"):
-                return styler.map(_style_profit_cell, subset=subset)
-            return styler.applymap(_style_profit_cell, subset=subset)
 
         col_year, col_month = st.columns(2)
 
@@ -293,3 +435,56 @@ else:
             styled_month = monthly.style.format({"손익합계": "{:,.0f}원"})
             styled_month = _apply_profit_style(styled_month, ["손익합계"])
             st.dataframe(styled_month, hide_index=True, width="stretch")
+
+    # ------------------------------------------------------------------
+    # 보유 현황: 아직 팔지 않은 수량을 현재가와 연동해서 평가금액을 보여줍니다.
+    # ------------------------------------------------------------------
+    st.divider()
+    st.subheader("보유 현황 (현재가 반영)")
+    st.caption(
+        "네이버 금융의 최근 종가를 기준으로 계산합니다(장중 실시간 가격이 아니라 "
+        "직전 거래일 종가일 수 있습니다). 종목코드를 입력하지 않은 종목은 현재가를 가져올 수 없습니다."
+    )
+
+    holdings = build_holdings(trades_df)
+
+    if holdings.empty:
+        st.info("현재 보유 중인 종목이 없습니다.")
+    else:
+        with st.spinner("현재가를 불러오는 중입니다..."):
+            holdings = attach_current_prices(holdings)
+
+        total_cost = holdings["매입금액"].sum()
+        has_price = holdings["평가금액"].notna().any()
+        total_value = holdings["평가금액"].dropna().sum() if has_price else None
+
+        col_a, col_b, col_c = st.columns(3)
+        col_a.metric("총 매입금액", f"{total_cost:,.0f}원")
+        if has_price:
+            col_b.metric("총 평가금액", f"{total_value:,.0f}원")
+            total_pl = total_value - total_cost
+            pl_color = PROFIT_COLOR if total_pl > 0 else (LOSS_COLOR if total_pl < 0 else "inherit")
+            col_c.markdown(
+                f"총 평가손익<br><span style='color:{pl_color}; font-size:1.5rem; font-weight:700'>{total_pl:,.0f}원</span>",
+                unsafe_allow_html=True,
+            )
+        else:
+            col_b.metric("총 평가금액", "정보 없음")
+
+        display_holdings = holdings.rename(columns={"stock_name": "종목명", "stock_code": "종목코드"})
+        styled_holdings = display_holdings.style.format(
+            {
+                "보유수량": "{:,.0f}",
+                "평균매입가": "{:,.0f}원",
+                "매입금액": "{:,.0f}원",
+                "현재가": lambda v: "정보 없음" if pd.isna(v) else f"{v:,.0f}원",
+                "평가금액": lambda v: "정보 없음" if pd.isna(v) else f"{v:,.0f}원",
+                "평가손익": lambda v: "-" if pd.isna(v) else f"{v:,.0f}원",
+            }
+        )
+        styled_holdings = _apply_profit_style(styled_holdings, ["평가손익"])
+        st.dataframe(styled_holdings, hide_index=True, width="stretch")
+
+        missing = holdings[holdings["현재가"].isna()]
+        if not missing.empty:
+            st.caption("현재가를 못 가져온 종목: " + ", ".join(missing["stock_name"].tolist()) + " (종목코드를 확인해주세요.)")
