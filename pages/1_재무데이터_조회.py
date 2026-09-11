@@ -18,6 +18,8 @@ from quarterly_compare import (
     build_quarter_list,
     compute_growth,
 )
+from naver_financials import get_annual_values, get_quarter_values
+from stock_price import get_current_price
 
 st.set_page_config(page_title="스톡노트 - 재무데이터 조회", layout="wide")
 
@@ -75,6 +77,58 @@ def render_company_picker(state_key, label="회사 이름 검색"):
             st.rerun()
 
     return st.session_state[selected_key]
+
+
+def _naver_single_lookup(stock_code, bsns_year, reprt_label):
+    """
+    OpenDART 연결이 안 될 때, 네이버 금융에서 같은 기간의 숫자를 대신 가져옵니다.
+
+    주의할 점이 하나 있습니다. OpenDART의 '반기'·'3분기' 보고서는 그 시점까지
+    쌓인 누적 금액인데, 네이버는 분기별로 따로 끊은 금액만 줍니다. 그래서
+    같은 의미가 되도록 여기서 분기 값을 더해서 누적 금액을 만듭니다.
+      - 1분기  = 1분기
+      - 반기   = 1분기 + 2분기
+      - 3분기  = 1분기 + 2분기 + 3분기
+      - 연간   = 네이버의 연간 실적 값을 그대로 사용
+    """
+    try:
+        year = int(str(bsns_year).strip())
+    except (TypeError, ValueError):
+        return {"오류": "사업연도를 숫자로 읽을 수 없습니다."}
+
+    if reprt_label == "사업보고서(연간)":
+        values = get_annual_values(stock_code, year)
+        if "오류" in values:
+            return values
+        merged = dict(values)
+    else:
+        needed_quarters = {"1분기": [1], "반기": [1, 2], "3분기": [1, 2, 3]}.get(reprt_label)
+        if not needed_quarters:
+            return {"오류": "알 수 없는 보고서 종류입니다."}
+
+        merged = {metric: 0 for metric in METRICS}
+        for quarter in needed_quarters:
+            part = get_quarter_values(stock_code, year, quarter)
+            if "오류" in part:
+                return part
+            for metric in METRICS:
+                amount = part.get(metric)
+                if amount is None:
+                    merged[metric] = None
+                elif merged[metric] is not None:
+                    merged[metric] += amount
+
+    # 화면이 기대하는 항목들을 모두 채워줍니다.
+    # 지배주주순이익과 유통주식수는 네이버 표에 없어서 채울 수 없고,
+    # 그 두 개가 있어야 계산되는 PER도 비워둡니다.
+    merged.setdefault("매출액", None)
+    merged.setdefault("영업이익", None)
+    merged.setdefault("당기순이익", None)
+    merged["지배주주순이익"] = None
+    merged["유통주식수"] = None
+    merged["PER"] = None
+    merged["현재가"] = get_current_price(stock_code)
+    return merged
 
 
 def format_growth(rate):
@@ -152,12 +206,24 @@ with tab_single:
             else:
                 reprt_code = REPRT_CODES[reprt_label]
                 result = get_per(corp_code, stock_code, bsns_year, reprt_code)
+                source = "OpenDART"
+
+                # OpenDART 연결이 막혀 있을 때는 네이버 금융에서 대신 가져옵니다.
+                # (연결 진단에서 확인된 대로, 배포 서버에서 OpenDART는 연결이
+                #  안 되지만 네이버는 정상 연결됩니다.)
+                if "오류" in result and stock_code:
+                    fallback = _naver_single_lookup(stock_code, bsns_year, reprt_label)
+                    if "오류" not in fallback:
+                        result = fallback
+                        source = "네이버"
+
                 st.session_state["single_result"] = {
                     "company": selected_company,
                     "year": bsns_year,
                     "reprt_label": reprt_label,
                     "stock_code": stock_code,
                     "result": result,
+                    "source": source,
                 }
 
     # 버튼을 누른 그 순간뿐 아니라, 다른 위젯을 눌러 화면이 다시 그려질 때도
@@ -174,6 +240,13 @@ with tab_single:
                 st.subheader(
                     f"{single_state['company']} {single_state['year']}년 {single_state['reprt_label']}"
                 )
+
+                if single_state.get("source") == "네이버":
+                    st.info(
+                        "⚠️ 전자공시(OpenDART) 연결이 되지 않아 **네이버 금융**의 숫자로 "
+                        "대신 보여드립니다. 억원 단위로 반올림된 값이며, 지배주주순이익과 "
+                        "PER은 네이버에서 제공하지 않아 '정보 없음'으로 표시됩니다."
+                    )
 
                 per_text = "정보 없음" if result["PER"] is None else f"{result['PER']}배"
                 shares_text = (
@@ -255,6 +328,7 @@ with tab_compare:
             st.error("회사를 먼저 검색해서 선택해주세요.")
         else:
             corp_code = find_corp_code(compare_company)
+            compare_stock_code = find_stock_code(compare_company)
             if corp_code is None:
                 st.session_state["compare_result"] = {
                     "error": f"'{compare_company}'을(를) corp_codes.csv에서 찾지 못했습니다."
@@ -263,12 +337,15 @@ with tab_compare:
                 with st.spinner(
                     "여러 분기 데이터를 불러오는 중입니다... 분기 수가 많으면 시간이 좀 걸려요."
                 ):
-                    values, errors = build_comparison_data(corp_code, quarters_preview)
+                    values, errors, sources = build_comparison_data(
+                        corp_code, quarters_preview, stock_code=compare_stock_code
+                    )
                 st.session_state["compare_result"] = {
                     "company": compare_company,
                     "quarters": quarters_preview,
                     "values": values,
                     "errors": errors,
+                    "sources": sources,
                 }
 
     compare_state = st.session_state.get("compare_result")
@@ -279,8 +356,18 @@ with tab_compare:
             quarters = compare_state["quarters"]
             values = compare_state["values"]
             errors = compare_state["errors"]
+            sources = compare_state.get("sources", {})
 
             st.subheader(f"{compare_state['company']} 분기별 비교")
+
+            naver_quarters = [key for key, name in sources.items() if name == "네이버"]
+            if naver_quarters:
+                naver_labels = ", ".join(f"{y}년 {q}분기" for y, q in sorted(naver_quarters))
+                st.info(
+                    "⚠️ 전자공시(OpenDART) 연결이 되지 않아, 아래 분기는 **네이버 금융**의 "
+                    f"숫자로 대신 채웠습니다: {naver_labels}. 네이버 숫자는 억원 단위로 "
+                    "반올림되어 있어서, 전자공시 기준 값과 끝자리가 조금 다를 수 있습니다."
+                )
 
             labels = [f"{y}년 {q}분기" for y, q in quarters]
             table_columns = ["지표", "구분"] + labels

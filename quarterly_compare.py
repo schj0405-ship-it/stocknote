@@ -19,6 +19,7 @@ get_financial_data.py에 있는 get_financial_data / REPRT_CODES 함수는
 import concurrent.futures
 
 from get_financial_data import get_financial_data, REPRT_CODES
+from naver_financials import get_quarter_values
 
 # 이 화면에서 비교할 지표 3가지 (사용자 요청: 매출액·영업이익·당기순이익)
 METRICS = ["매출액", "영업이익", "당기순이익"]
@@ -148,14 +149,17 @@ def _needed_reports(quarters):
     return needed
 
 
-def build_comparison_data(corp_code, quarters):
+def build_comparison_data(corp_code, quarters, stock_code=None):
     """
     quarters: [(연도, 분기), ...] (시간 순서)
+    stock_code: 종목코드(6자리). OpenDART 조회가 실패했을 때 네이버 금융에서
+                대신 가져오기 위해 필요합니다. 없으면 대체 조회를 건너뜁니다.
 
-    반환값: (values, errors)
+    반환값: (values, errors, sources)
     - values: {(연도, 분기): {"매출액": .., "영업이익": .., "당기순이익": ..}}
       (오류가 난 분기는 세 지표 모두 None으로 채워서, 표를 그릴 때 예외 처리를 안 해도 되게 함)
     - errors: {(연도, 분기): "오류 안내 문구"}  (오류 없으면 빈 딕셔너리)
+    - sources: {(연도, 분기): "OpenDART" 또는 "네이버"}  어디서 가져온 숫자인지 표시용
 
     필요한 보고서들을 하나씩 순서대로 기다리지 않고 동시에(병렬로)
     요청합니다. 예를 들어 4개 분기를 비교하면 서로 다른 보고서를 최대
@@ -190,6 +194,7 @@ def build_comparison_data(corp_code, quarters):
 
     values = {}
     errors = {}
+    sources = {}
     for year, quarter in quarters:
         result = get_single_quarter(cache, corp_code, year, quarter)
         if "오류" in result:
@@ -197,7 +202,29 @@ def build_comparison_data(corp_code, quarters):
             values[(year, quarter)] = {m: None for m in METRICS}
         else:
             values[(year, quarter)] = result
-    return values, errors
+            sources[(year, quarter)] = "OpenDART"
+
+    # ------------------------------------------------------------------
+    # 대체 경로: OpenDART로 못 가져온 분기는 네이버 금융에서 다시 시도합니다.
+    #
+    # 배포 서버(미국)에서 OpenDART 서버로는 연결 자체가 막혀 있는 것이
+    # 연결 진단으로 확인되었습니다. 반면 네이버 금융은 같은 서버에서
+    # 정상적으로 연결됩니다. 그래서 OpenDART가 실패한 분기만 골라서
+    # 네이버의 '기업실적분석' 표에서 같은 항목을 대신 가져옵니다.
+    # (네이버 숫자는 억원 단위로 반올림되어 있고 최근 4~6개 분기만
+    #  제공되므로, 화면에 어느 쪽에서 가져온 숫자인지 표시해줍니다.)
+    # ------------------------------------------------------------------
+    if errors and stock_code:
+        for key in list(errors.keys()):
+            year, quarter = key
+            fallback = get_quarter_values(stock_code, year, quarter)
+            if "오류" in fallback:
+                continue  # 네이버에도 없으면 원래 오류를 그대로 둡니다.
+            values[key] = {m: fallback.get(m) for m in METRICS}
+            sources[key] = "네이버"
+            del errors[key]
+
+    return values, errors, sources
 
 
 def compute_growth(previous, current):

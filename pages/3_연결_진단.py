@@ -22,12 +22,34 @@
 이 파일은 지워도 됩니다(pages 폴더에서 삭제하면 메뉴에서 사라집니다).
 """
 
-import json
+import re
 import socket
 import time
 
 import requests
 import streamlit as st
+
+
+def _mask_secrets(text):
+    """
+    화면에 내보내기 전에 인증키를 가립니다.
+
+    [중요 - 이전 버전의 문제]
+    처음 만든 진단 화면은 오류 메시지를 그대로 보여줬는데, requests가 만드는
+    오류 메시지에는 요청 주소 전체가 들어있고 거기에 OpenDART 인증키가
+    포함되어 있었습니다. 그래서 인증키가 화면에 그대로 노출됐습니다.
+    이 함수로 인증키 값을 전부 가리도록 고쳤습니다.
+    """
+    text = str(text)
+    text = re.sub(r"crtfc_key=[^&\s'\"]+", "crtfc_key=***가림***", text)
+    # 혹시 주소 형태가 아니라 값만 들어있는 경우까지 대비해서, 실제 키 값도 직접 가립니다.
+    try:
+        real_key = str(st.secrets["DART_API_KEY"])
+        if real_key:
+            text = text.replace(real_key, "***가림***")
+    except Exception:
+        pass
+    return text
 
 st.set_page_config(page_title="스톡노트 - 연결 진단", layout="wide")
 
@@ -54,12 +76,13 @@ def _run(label, func):
         elapsed = time.time() - start
         st.success(f"✅ {label} — 성공 ({elapsed:.1f}초)")
         if result:
-            st.code(str(result), language="text")
+            st.code(_mask_secrets(result), language="text")
         return True, result
     except Exception as e:
         elapsed = time.time() - start
         st.error(f"❌ {label} — 실패 ({elapsed:.1f}초)")
-        st.code(f"{type(e).__name__}: {e}", language="text")
+        # 인증키가 섞여 있을 수 있으므로 반드시 가린 뒤에 보여줍니다.
+        st.code(_mask_secrets(f"{type(e).__name__}: {e}"), language="text")
         return False, e
 
 
@@ -149,6 +172,56 @@ def step7_naver():
     return f"응답 코드 {r.status_code} / 받은 문서 길이 {len(r.text):,}자"
 
 
+def step8_naver_financials():
+    """
+    OpenDART 대신 쓰는 '네이버 재무데이터'가 이 서버에서 실제로 읽히는지
+    확인합니다. 삼성전자(005930)로 시험해서, 읽어온 연도·분기를 보여줍니다.
+    """
+    from naver_financials import fetch_naver_financials
+
+    fetch_naver_financials.clear()  # 저장된 값 말고 지금 실제로 다시 받아옵니다.
+    data = fetch_naver_financials("005930")
+    if "오류" in data:
+        raise RuntimeError(data["오류"])
+
+    annual_years = ", ".join(str(y) for y in sorted(data["연간"]))
+    quarters = ", ".join(f"{y}년 {q}분기" for y, q in sorted(data["분기"]))
+    sample = None
+    if data["분기"]:
+        key = sorted(data["분기"])[-1]
+        values = data["분기"][key]
+        revenue = values.get("매출액")
+        sample = (
+            f"{key[0]}년 {key[1]}분기 매출액: "
+            + (f"{revenue:,}원" if revenue else "정보 없음")
+        )
+
+    return (
+        f"읽어온 연간 실적: {annual_years or '없음'}\n"
+        f"읽어온 분기 실적: {quarters or '없음'}\n"
+        f"{sample or ''}"
+    )
+
+
+def step9_other_sources():
+    """
+    나중에 더 좋은 방법으로 바꿀 수 있을지 미리 확인해둡니다.
+    - dart.fss.or.kr : 전자공시 본 사이트(OpenDART와 다른 서버)
+    - apis.data.go.kr : 공공데이터포털(금융위원회 기업재무정보 API 제공처)
+    """
+    results = []
+    for name, url in [
+        ("전자공시 본사이트(dart.fss.or.kr)", "https://dart.fss.or.kr/"),
+        ("공공데이터포털(apis.data.go.kr)", "https://apis.data.go.kr/"),
+    ]:
+        try:
+            r = requests.get(url, timeout=SHORT_TIMEOUT)
+            results.append(f"{name}: 연결됨 (응답 코드 {r.status_code})")
+        except Exception as e:
+            results.append(f"{name}: 연결 실패 ({type(e).__name__})")
+    return "\n".join(results)
+
+
 st.info(
     "아래 버튼을 누르면 진단이 시작됩니다. 전부 합쳐 최대 1분 정도 걸릴 수 있습니다."
 )
@@ -177,6 +250,12 @@ if st.button("진단 시작", type="primary"):
     st.subheader("7단계. 네이버 금융 연결 (주가)")
     results["naver"] = _run("네이버 금융", step7_naver)[0]
 
+    st.subheader("8단계. 네이버 재무데이터 읽기 (OpenDART 대체 경로)")
+    results["naver_fin"] = _run("네이버 재무데이터", step8_naver_financials)[0]
+
+    st.subheader("9단계. 다른 데이터 제공처 연결 여부 (참고용)")
+    _run("다른 제공처", step9_other_sources)
+
     # ------------------------------------------------------------------
     # 결과 해석: 어느 단계에서 막혔는지에 따라 원인이 달라집니다.
     # ------------------------------------------------------------------
@@ -194,15 +273,29 @@ if st.button("진단 시작", type="primary"):
             "이건 코드 문제가 아니라 서버의 이름 조회 설정 문제입니다."
         )
     elif not results["tcp"]:
-        st.error(
-            "OpenDART 서버의 IP까지는 알아냈지만, 연결 자체가 안 됩니다.\n\n"
-            "가장 유력한 원인은 **OpenDART(금융감독원) 쪽에서 해외 서버의 접속을 "
-            "막고 있는 것**입니다. 한국 공공기관 서비스는 해외 IP를 차단하는 경우가 "
-            "흔하고, 이 앱은 미국에 있는 Streamlit Cloud에서 실행됩니다.\n\n"
-            "이 경우 코드를 어떻게 고쳐도 해결되지 않습니다. 해결 방향은 "
-            "①내 컴퓨터에서 실행해서 쓰기 ②한국에 있는 서버로 옮기기 "
-            "③한국에 있는 중계 서버(프록시)를 거치기 중 하나입니다."
-        )
+        if results.get("naver_fin"):
+            st.warning(
+                "OpenDART 서버로는 연결이 되지 않지만, **대체 경로(네이버 금융)는 "
+                "정상 작동합니다.**\n\n"
+                "OpenDART가 막힌 이유는 금융감독원 쪽에서 이 서버(미국 Streamlit "
+                "Cloud)의 접속을 차단하고 있기 때문으로 보입니다. 같은 한국 서버인 "
+                "네이버는 잘 되는 것으로 보아, '거리가 멀어서'가 아니라 OpenDART "
+                "쪽의 차단이 원인입니다. 이건 코드로는 풀 수 없습니다.\n\n"
+                "그래서 재무데이터 조회 화면은 OpenDART가 실패하면 자동으로 네이버 "
+                "숫자를 대신 보여주도록 해두었습니다. 네이버 숫자는 억원 단위로 "
+                "반올림되어 있고 최근 4~6개 분기만 제공된다는 점만 감안하시면 됩니다.\n\n"
+                "전자공시 원본 숫자가 꼭 필요하시면, 내 컴퓨터에서 앱을 실행하면 "
+                "(한국에서 접속하는 것이므로) OpenDART가 정상 작동합니다."
+            )
+        else:
+            st.error(
+                "OpenDART 서버의 IP까지는 알아냈지만, 연결 자체가 안 됩니다.\n\n"
+                "가장 유력한 원인은 **OpenDART(금융감독원) 쪽에서 해외 서버의 접속을 "
+                "막고 있는 것**입니다. 한국 공공기관 서비스는 해외 IP를 차단하는 경우가 "
+                "흔하고, 이 앱은 미국에 있는 Streamlit Cloud에서 실행됩니다.\n\n"
+                "게다가 대체 경로인 네이버 재무데이터(8단계)도 실패했습니다. "
+                "8단계의 오류 내용을 알려주시면 그 부분을 고치겠습니다."
+            )
     elif not results["reachable"]:
         st.error(
             "연결은 되는데 OpenDART가 정상적인 답을 주지 않습니다. 방화벽이나 "

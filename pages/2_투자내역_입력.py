@@ -216,36 +216,6 @@ def delete_all_trades():
     supabase.table("trades").delete().eq("user_id", user.id).execute()
 
 
-def delete_one_trade(trade_id):
-    """
-    번호 하나만 골라서 그 줄만 딱 삭제합니다(표 전체를 다시 저장하지 않습니다).
-    trade_id는 화면의 "번호"(1,2,3...)가 아니라, Supabase가 각 줄마다 매겨둔
-    고유번호(id)입니다 - 화면 번호는 삭제하면 매번 다시 매겨지지만, id는
-    한 줄을 정확히 지목하기 위해 절대 안 바뀌는 값이라 이걸 기준으로 지웁니다.
-    """
-    _save_undo_snapshot("한 줄 삭제")
-    supabase.table("trades").delete().eq("user_id", user.id).eq("id", trade_id).execute()
-
-
-def load_trades_for_delete():
-    """
-    "한 줄만 골라서 삭제" 목록에 쓸, 가벼운 조회입니다. 위 load_trades()와
-    똑같이 id 오름차순(가장 먼저 저장한 순서)으로 정렬해서, 화면 번호가
-    위쪽 "저장된 투자내역" 표의 번호와 항상 똑같이 맞도록 합니다.
-    """
-    response = (
-        supabase.table("trades")
-        .select("id, stock_name, buy_date, sell_date, quantity, sell_quantity")
-        .eq("user_id", user.id)
-        .order("id", desc=False)
-        .execute()
-    )
-    rows = response.data or []
-    for i, row in enumerate(rows, start=1):
-        row[DISPLAY_NO_COL] = i
-    return rows
-
-
 def replace_all_trades(df):
     """
     표에서 수정한 내용을 전부 반영합니다.
@@ -508,56 +478,6 @@ else:
             restore_undo_snapshot()
             st.success("직전 상태로 되돌렸습니다.")
             st.rerun()
-
-    # ------------------------------------------------------------------
-    # 한 줄만 골라서 삭제: 위 표에서 행을 선택하고 작은 휴지통 아이콘을 누른 뒤
-    # "변경사항 저장"을 누르는 방식은 아이콘이 작아서 찾기 어렵다는 의견이
-    # 있어서, 줄마다 알아보기 쉬운 크기의 "삭제" 버튼을 따로 만들었습니다.
-    # 이 버튼은 누르는 즉시 그 줄만 지워지고(표 전체를 다시 저장할 필요 없음),
-    # 위의 "되돌리기"로 바로 복구할 수도 있습니다.
-    # ------------------------------------------------------------------
-    st.divider()
-    st.subheader("🗑️ 한 줄만 골라서 삭제")
-    st.caption("표를 고치고 '변경사항 저장'을 누르지 않아도, 이 줄의 [삭제] 버튼만 누르면 그 줄 하나만 바로 지워집니다.")
-
-    delete_rows = load_trades_for_delete()
-    if not delete_rows:
-        st.caption("삭제할 내역이 없습니다.")
-    else:
-        col_widths = [0.7, 2.2, 1.4, 1.4, 1.3, 1.3, 1.1]
-        header_cols = st.columns(col_widths)
-        for col, label in zip(
-            header_cols, ["번호", "종목명", "매수일", "매도일", "매입수량", "매도수량", ""]
-        ):
-            if label:
-                col.markdown(f"**{label}**")
-
-        for row in delete_rows:
-            row_cols = st.columns(col_widths)
-            row_cols[0].write(row[DISPLAY_NO_COL])
-            row_cols[1].write(row.get("stock_name") or "")
-            row_cols[2].write(row.get("buy_date") or "-")
-            row_cols[3].write(row.get("sell_date") or "-")
-            row_cols[4].write(row.get("quantity") or 0)
-            row_cols[5].write(row.get("sell_quantity") or 0)
-            try:
-                # 최신 Streamlit은 width="stretch"를 씁니다(칸 너비만큼 버튼을 꽉 채워
-                # 더 눈에 잘 띄게 만듭니다).
-                clicked = row_cols[6].button(
-                    "삭제", key=f"delete_one_{row['id']}", type="primary", width="stretch"
-                )
-            except TypeError:
-                # 배포 서버의 Streamlit 버전이 예전 것이면 옛날 옵션으로 대신 시도합니다.
-                clicked = row_cols[6].button(
-                    "삭제",
-                    key=f"delete_one_{row['id']}",
-                    type="primary",
-                    use_container_width=True,
-                )
-            if clicked:
-                delete_one_trade(row["id"])
-                st.success(f"{row.get('stock_name')} ({row[DISPLAY_NO_COL]}번) 줄이 삭제되었습니다.")
-                st.rerun()
 
     # ------------------------------------------------------------------
     # 손익 분석: 매도까지 끝난 내역만 모아서 연도별·연도월별로 손익을 집계합니다.
