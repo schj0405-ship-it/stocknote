@@ -175,32 +175,18 @@ def step7_naver():
 def step8_naver_financials():
     """
     OpenDART 대신 쓰는 '네이버 재무데이터'가 이 서버에서 실제로 읽히는지
-    확인합니다. 삼성전자(005930)로 시험해서, 읽어온 연도·분기를 보여줍니다.
+    확인합니다. 삼성전자(005930)로 시험합니다.
+
+    [2026-09-12 보강]
+    예전에는 실패하면 "표를 못 찾았습니다" 한 줄만 보여줘서, 왜 못 찾았는지
+    (글자가 깨졌는지, 페이지가 다르게 왔는지, 표 자체가 없는지) 알 수 없었습니다.
+    이제는 두 가지 방법(모바일 자료 / 표 읽기)을 각각 시도해서, 각 방법이 어디서
+    어떻게 막혔는지를 줄마다 그대로 보여줍니다.
     """
-    from naver_financials import fetch_naver_financials
+    from naver_financials import diagnose, fetch_naver_financials
 
     fetch_naver_financials.clear()  # 저장된 값 말고 지금 실제로 다시 받아옵니다.
-    data = fetch_naver_financials("005930")
-    if "오류" in data:
-        raise RuntimeError(data["오류"])
-
-    annual_years = ", ".join(str(y) for y in sorted(data["연간"]))
-    quarters = ", ".join(f"{y}년 {q}분기" for y, q in sorted(data["분기"]))
-    sample = None
-    if data["분기"]:
-        key = sorted(data["분기"])[-1]
-        values = data["분기"][key]
-        revenue = values.get("매출액")
-        sample = (
-            f"{key[0]}년 {key[1]}분기 매출액: "
-            + (f"{revenue:,}원" if revenue else "정보 없음")
-        )
-
-    return (
-        f"읽어온 연간 실적: {annual_years or '없음'}\n"
-        f"읽어온 분기 실적: {quarters or '없음'}\n"
-        f"{sample or ''}"
-    )
+    return diagnose("005930")
 
 
 def step8b_naver_price():

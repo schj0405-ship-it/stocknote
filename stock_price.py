@@ -11,9 +11,14 @@
 lxml이라는 별도 부품을 필요로 하고, 배포 서버에서는 이 부품을 찾지 못해
 ImportError가 나고 있었습니다. 이 파일은 실패하면 조용히 None을 돌려주도록
 되어 있어서, 오류가 눈에 띄지 않은 채 "현재가 정보 없음"으로만 보였습니다.
-(연결 진단 8단계에서 같은 ImportError가 잡히면서 발견했습니다.)
 이제는 파이썬에 기본으로 들어있는 기능만 쓰는 html_table.py로 바꿔서,
 추가 부품 설치 여부와 상관없이 항상 동작합니다.
+
+[2026-09-12 보강]
+1. 글자 저장 방식(인코딩)을 자동으로 판별합니다. 예전에는 euc-kr로 고정해뒀는데,
+   네이버가 페이지를 UTF-8로 바꾸면 한글이 전부 깨져서 '종가'라는 글자를 찾지
+   못하게 됩니다.
+2. 표 읽기가 실패하면, 네이버 모바일 금융 자료(JSON)에서 한 번 더 시도합니다.
 """
 
 import re
@@ -21,9 +26,27 @@ import re
 import requests
 import streamlit as st
 
-from html_table import parse_tables, table_text
+from html_table import decode_response, parse_tables, table_text
 
 DATE_PATTERN = re.compile(r"^\d{4}\.\d{2}\.\d{2}$")
+DAILY_PRICE_URL = "https://finance.naver.com/item/sise_day.naver?code={code}&page=1"
+MOBILE_BASIC_URL = "https://m.stock.naver.com/api/stock/{code}/basic"
+
+PC_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Referer": "https://finance.naver.com/",
+}
+MOBILE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+    ),
+    "Referer": "https://m.stock.naver.com/",
+    "Accept": "application/json",
+}
 
 
 def _find_daily_price_table(tables):
@@ -71,11 +94,30 @@ def fetch_price_from_html(html_text):
     return None
 
 
+def _fetch_price_from_mobile_api(stock_code):
+    """표 읽기가 실패했을 때 쓰는 보조 방법입니다(JSON으로 현재가를 받아옵니다)."""
+    url = MOBILE_BASIC_URL.format(code=str(stock_code).zfill(6))
+    try:
+        response = requests.get(url, headers=MOBILE_HEADERS, timeout=8)
+        payload = response.json()
+    except Exception:
+        return None
+
+    for key in ("closePrice", "nowPrice", "tradePrice", "currentPrice"):
+        value = payload.get(key)
+        if value is None:
+            continue
+        try:
+            return int(str(value).replace(",", "").strip())
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def get_current_price(stock_code):
     """
-    네이버 금융의 '일별 시세' 페이지에서 가장 최근 종가(직전 거래일 마감 가격)를
-    가져옵니다.
+    네이버 금융에서 가장 최근 종가(직전 거래일 마감 가격)를 가져옵니다.
 
     stock_code: 종목코드 (6자리, 예: 삼성전자 "005930")
     반환값: 정수(원 단위) 또는 못 가져왔으면 None
@@ -83,16 +125,17 @@ def get_current_price(stock_code):
     if not stock_code:
         return None
 
-    url = f"https://finance.naver.com/item/sise_day.naver?code={str(stock_code).zfill(6)}&page=1"
-    headers = {"User-Agent": "Mozilla/5.0"}  # 프로그램이 아니라 웹 브라우저인 것처럼 알려주는 표시
+    url = DAILY_PRICE_URL.format(code=str(stock_code).zfill(6))
 
     try:
-        response = requests.get(url, headers=headers, timeout=8)
-        response.encoding = "euc-kr"  # 네이버 금융 페이지가 쓰는 글자 인코딩
-        return fetch_price_from_html(response.text)
+        response = requests.get(url, headers=PC_HEADERS, timeout=8)
+        price = fetch_price_from_html(decode_response(response))
+        if price:
+            return price
     except Exception:
-        # 페이지 구조가 예상과 다르거나 네트워크 문제가 있으면 None을 돌려줍니다.
-        return None
+        pass  # 아래 보조 방법으로 한 번 더 시도합니다.
+
+    return _fetch_price_from_mobile_api(stock_code)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import re
+import socket
 import time
 import random
 import threading
@@ -94,6 +95,55 @@ def _describe_error(e):
     return f"{type(e).__name__}: {text}"[:200]
 
 
+OPENDART_HOST = "opendart.fss.or.kr"
+
+# 연결 가능 여부를 짧게 확인해두는 값들입니다(아래 opendart_reachable 설명 참고).
+_REACH_CHECK_TIMEOUT = 3      # 확인에 쓰는 시간(초)
+_REACH_OK_TTL = 600           # '연결 됨'으로 확인되면 10분 동안은 다시 확인하지 않음
+_REACH_FAIL_TTL = 120         # '막힘'으로 확인되면 2분 뒤에 다시 확인
+_reach_lock = threading.Lock()
+_reach_state = {"ok": None, "checked_at": 0.0}
+
+
+def opendart_reachable():
+    """
+    OpenDART 서버에 연결이 되는 상태인지 '아주 빠르게' 확인합니다.
+
+    [왜 이게 필요한가 - 조회가 오래 걸리던 이유]
+    배포 서버(미국 Streamlit Cloud)에서는 OpenDART가 아예 차단되어 있어서,
+    요청을 보내면 거절당하는 게 아니라 '아무 대답도 없이' 시간 초과가 날 때까지
+    기다리게 됩니다. 보고서 하나에 8초 × 재시도 2번, 보고서가 4개면 최악의
+    경우 1분 가까이 기다린 끝에 결국 실패했습니다. 그래서 사용자 입장에서는
+    "한참 돌다가 아무것도 안 나오는" 상태가 됐습니다.
+
+    그래서 본격적으로 요청을 보내기 전에, 문이 열려 있는지만 3초 안에 한 번
+    두드려 봅니다(실제 데이터를 주고받지 않고 연결만 시도). 막혀 있으면 즉시
+    포기하고 네이버 쪽 대체 경로로 넘어가기 때문에, 기다리는 시간이 1분에서
+    3초로 줄어듭니다. 확인 결과는 잠깐 기억해뒀다가(성공 10분, 실패 2분)
+    매번 다시 두드리지 않습니다.
+    """
+    now = time.monotonic()
+    with _reach_lock:
+        known = _reach_state["ok"]
+        age = now - _reach_state["checked_at"]
+    if known is not None and age < (_REACH_OK_TTL if known else _REACH_FAIL_TTL):
+        return known
+
+    try:
+        connection = socket.create_connection(
+            (OPENDART_HOST, 443), timeout=_REACH_CHECK_TIMEOUT
+        )
+        connection.close()
+        result = True
+    except OSError:
+        result = False
+
+    with _reach_lock:
+        _reach_state["ok"] = result
+        _reach_state["checked_at"] = time.monotonic()
+    return result
+
+
 def _request_json_with_retry(url, params):
     """
     OpenDART에 요청을 보내고 JSON으로 바꿔서 돌려줍니다.
@@ -105,6 +155,12 @@ def _request_json_with_retry(url, params):
     - 재시도를 다 써도 실패하면, 마지막 오류를 그대로 위로 올려서 호출한
       쪽에서 "왜" 실패했는지(시간 초과/연결 거부/응답 코드 등) 알 수 있게 합니다.
     """
+    # 막혀 있는 게 이미 확인된 상태라면, 8초씩 기다리지 말고 바로 포기합니다.
+    if not opendart_reachable():
+        raise requests.exceptions.ConnectionError(
+            f"{OPENDART_HOST} 서버에 연결할 수 없습니다(연결 시도 {_REACH_CHECK_TIMEOUT}초 내 응답 없음)."
+        )
+
     last_error = None
     for attempt in range(REQUEST_RETRIES):
         with _opendart_semaphore:
