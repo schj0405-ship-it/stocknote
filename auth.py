@@ -42,6 +42,38 @@ def _get_cookie_controller():
     return CookieController(key=COOKIE_STORE_KEY)
 
 
+def read_setting(name, default=None):
+    """
+    화면에서 사용자가 정해둔 설정값(예: 매도 경고 기준 퍼센트)을 브라우저
+    쿠키에서 읽어옵니다. 로그인 정보와 같은 방식이라, 새로고침하거나
+    브라우저를 껐다 켜도 값이 남아있습니다.
+
+    아직 브라우저에서 쿠키를 받아오기 전이거나 저장된 값이 없으면
+    default(기본값)를 돌려줍니다.
+    """
+    try:
+        controller = _get_cookie_controller()
+        value = controller.get(f"stocknote_setting_{name}")
+    except Exception:
+        return default
+    return default if value is None else value
+
+
+def save_setting(name, value):
+    """
+    설정값을 브라우저 쿠키에 저장합니다(30일 보관).
+    저장에 실패해도 화면 동작은 그대로 이어지도록 조용히 넘어갑니다.
+    """
+    try:
+        controller = _get_cookie_controller()
+        expires = datetime.now(timezone.utc) + timedelta(days=COOKIE_MAX_AGE_DAYS)
+        controller.set(
+            f"stocknote_setting_{name}", value, expires=expires, same_site="lax"
+        )
+    except Exception:
+        pass
+
+
 def _cookies_loaded():
     """
     브라우저에 저장된 쿠키를 실제로 읽어왔는지 여부입니다.

@@ -25,11 +25,10 @@
    제외합니다.
 """
 
-from io import StringIO
-
-import pandas as pd
 import requests
 import streamlit as st
+
+from html_table import parse_tables, split_header_and_data, table_text
 
 NAVER_MAIN_URL = "https://finance.naver.com/item/main.naver?code={code}"
 REQUEST_TIMEOUT = 8
@@ -48,12 +47,9 @@ UNIT_EOK = 100_000_000
 def _clean_column_label(label):
     """
     열 이름을 '2025.03' 같은 깔끔한 형태로 다듬습니다.
-    네이버 표의 열 이름은 '2025.12(E)'(예상치)나 여러 줄로 겹쳐진 형태로
-    올 수 있어서, 앞에서부터 '연도.월' 부분만 잘라냅니다.
+    네이버 표의 열 이름은 '2025.12(E)'(예상치) 형태로 올 수 있어서,
+    예상치는 제외하고 '연도.월' 부분만 잘라냅니다.
     """
-    if isinstance(label, tuple):
-        # 여러 층으로 된 열 이름이면 마지막(가장 구체적인) 것을 씁니다.
-        label = label[-1]
     text = str(label).strip()
     if "(E)" in text or "(e)" in text:
         return None  # 예상치는 실제 실적이 아니므로 제외
@@ -86,17 +82,38 @@ def _find_performance_table(tables):
     """
     네이버 종목 페이지에는 표가 여러 개 있습니다. 그중 '기업실적분석' 표를
     찾아내야 하는데, 표의 순서는 페이지가 바뀌면 달라질 수 있어서 순서로
-    찾지 않고 "'주요재무정보'라는 글자가 들어있고, 항목에 '매출액'이 있는 표"
-    를 조건으로 찾습니다.
+    찾지 않고 "'주요재무정보'와 '매출액'이라는 글자가 둘 다 들어있는 표"를
+    조건으로 찾습니다.
     """
     for table in tables:
-        columns_text = " ".join(str(c) for c in table.columns)
-        if "주요재무정보" not in columns_text:
-            continue
-        first_column = table.iloc[:, 0].astype(str)
-        if first_column.str.contains("매출액").any():
+        text = table_text(table)
+        if "주요재무정보" in text and "매출액" in text:
             return table
     return None
+
+
+def _build_columns(header_rows):
+    """
+    제목 줄 두 개를 합쳐서, 각 칸이 '연간 실적'인지 '분기 실적'인지와
+    어느 시점(2025.03 등)인지를 짝지어 돌려줍니다.
+
+    네이버 표의 제목은 두 줄로 되어 있습니다.
+      첫째 줄 : [주요재무정보(두 줄 차지)] [최근 연간 실적(3칸 차지)] [최근 분기 실적(4칸 차지)]
+      둘째 줄 : [2023.12] [2024.12] [2025.12(E)] [2025.03] [2025.06] ...
+    그래서 첫째 줄에서 '몇 칸을 차지하는지(colspan)'만큼 이름을 늘어놓으면
+    둘째 줄의 시점들과 하나씩 정확히 맞춰집니다.
+    """
+    if len(header_rows) < 2:
+        return []
+
+    groups = []
+    for cell in header_rows[0]:
+        if cell["rowspan"] > 1:
+            continue  # '주요재무정보' 칸은 항목 이름 칸이라 제외합니다.
+        groups.extend([cell["text"]] * cell["colspan"])
+
+    periods = [cell["text"] for cell in header_rows[1]]
+    return list(zip(groups, periods))
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -120,30 +137,40 @@ def fetch_naver_financials(stock_code):
     try:
         response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         response.encoding = "euc-kr"  # 네이버 금융이 쓰는 글자 인코딩
-        tables = pd.read_html(StringIO(response.text))
+        tables = parse_tables(response.text)
     except Exception as e:
-        return {"오류": f"네이버 금융 연결에 실패했습니다. ({type(e).__name__})"}
+        # 오류 종류만이 아니라 실제 내용까지 함께 알려줍니다.
+        # (지난번에는 종류만 표시해서 "ImportError"라는 것만 알 수 있었고,
+        #  무엇이 없다는 것인지 알 수 없어 원인 파악이 늦어졌습니다.)
+        return {"오류": f"네이버 금융 연결에 실패했습니다. ({type(e).__name__}: {e})"}
 
     table = _find_performance_table(tables)
     if table is None:
         return {"오류": "네이버 금융 페이지에서 '기업실적분석' 표를 찾지 못했습니다."}
 
-    # 각 열이 연간 실적인지 분기 실적인지 구분합니다.
-    # 네이버 표의 열 이름은 ('최근 연간 실적', '2024.12') 처럼 두 층으로
-    # 되어 있어서, 첫 번째 층에 '연간'/'분기'가 들어있는지로 판단합니다.
+    header_rows, data_rows = split_header_and_data(table)
+    columns = _build_columns(header_rows)
+    if not columns:
+        return {"오류": "네이버 '기업실적분석' 표의 제목 줄을 해석하지 못했습니다."}
+
+    # 항목 이름(매출액 등) → 그 줄의 값들
+    row_values = {}
+    for row in data_rows:
+        if not row:
+            continue
+        label = row[0]["text"].strip()
+        row_values[label] = [cell["text"] for cell in row[1:]]
+
     annual = {}
     quarterly = {}
 
-    labels = table.iloc[:, 0].astype(str).str.strip()
-
-    for column in table.columns[1:]:
-        period = _clean_column_label(column)
+    for index, (group, period_label) in enumerate(columns):
+        period = _clean_column_label(period_label)
         if period is None:
             continue
 
-        top_level = str(column[0]) if isinstance(column, tuple) else ""
-        is_quarter = "분기" in top_level
-        is_annual = "연간" in top_level
+        is_quarter = "분기" in group
+        is_annual = "연간" in group
         if not is_quarter and not is_annual:
             continue
 
@@ -152,11 +179,11 @@ def fetch_naver_financials(stock_code):
 
         values = {}
         for row_name, metric in METRIC_ROW_NAMES.items():
-            matched = table[labels == row_name]
-            if matched.empty:
+            cells = row_values.get(row_name)
+            if not cells or index >= len(cells):
                 values[metric] = None
-                continue
-            values[metric] = _parse_amount(matched.iloc[0][column])
+            else:
+                values[metric] = _parse_amount(cells[index])
 
         if is_annual:
             annual[year] = values

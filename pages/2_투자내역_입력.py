@@ -4,7 +4,7 @@ from datetime import date
 import pandas as pd
 import streamlit as st
 
-from auth import get_supabase_client, require_login
+from auth import get_supabase_client, read_setting, require_login, save_setting
 from get_financial_data import find_stock_code
 from stock_price import get_current_price
 
@@ -21,6 +21,10 @@ supabase = get_supabase_client()
 # 표에서 쓰는 화면 표시용 번호/손익 칸 이름 (DB에는 저장되지 않는, 화면에서만 계산해서 보여주는 칸)
 DISPLAY_NO_COL = "번호"
 PROFIT_COL = "손익"
+
+# 매도 경고 기준(%)을 기억해두는 이름과 기본값
+STOP_LOSS_KEY = "stop_loss_pct"
+DEFAULT_STOP_LOSS_PCT = 10
 
 # 흰색 배경에서 이익(초록)·손실(빨강)을 또렷하게 보여주기 위한 색상.
 # 1_재무데이터_조회.py의 증감률 배지 색과 통일했습니다.
@@ -542,16 +546,46 @@ else:
     # 매도 경고등(손절 알림): 평균 매입가보다 현재가가 이 비율(%) 이상 떨어지면
     # 아래 표에서 그 종목 줄을 빨간색으로 표시합니다. 몇 %부터 경고할지는
     # 사람마다 투자 스타일이 달라서, 숫자를 직접 정할 수 있게 만들었습니다.
-    # (지금 로그인한 브라우저 화면에서만 기억되고, 새로고침하거나 나중에
-    # 다시 접속하면 기본값 10%로 돌아갑니다.)
+    #
+    # 이 숫자는 브라우저 쿠키에 저장하기 때문에, 새로고침하거나 나중에 다시
+    # 접속해도 마지막에 정한 값이 그대로 남아있습니다(로그인 정보를 유지하는
+    # 것과 같은 방식이며 30일간 보관됩니다).
+    saved_stop_loss = read_setting("stop_loss_pct")
+
+    if saved_stop_loss is not None and not st.session_state.get("_stop_loss_restored"):
+        # 화면이 처음 열릴 때는 아직 쿠키가 도착하기 전이라 기본값이 보이고,
+        # 쿠키가 도착하는 순간 이 부분이 실행되어 저장해둔 값으로 바뀝니다.
+        try:
+            st.session_state[STOP_LOSS_KEY] = int(float(saved_stop_loss))
+        except (TypeError, ValueError):
+            pass
+        st.session_state["_stop_loss_restored"] = True
+    elif STOP_LOSS_KEY not in st.session_state:
+        st.session_state[STOP_LOSS_KEY] = DEFAULT_STOP_LOSS_PCT
+
     stop_loss_pct = st.number_input(
         "🔴 매도 경고 기준 (평균 매입가 대비 하락률, %)",
         min_value=1,
         max_value=90,
-        value=st.session_state.get("stop_loss_pct", 10),
         step=1,
-        key="stop_loss_pct",
+        key=STOP_LOSS_KEY,
         help="예: 10을 넣으면, 평균 매입가보다 10% 이상 떨어진 보유 종목이 아래 표에서 빨간색으로 표시됩니다.",
+    )
+
+    # 값이 바뀌었을 때만 저장합니다(같은 값을 매번 다시 저장하지 않도록).
+    try:
+        previous_stop_loss = (
+            int(float(saved_stop_loss)) if saved_stop_loss is not None else None
+        )
+    except (TypeError, ValueError):
+        previous_stop_loss = None
+
+    if previous_stop_loss != int(stop_loss_pct):
+        save_setting("stop_loss_pct", int(stop_loss_pct))
+
+    st.caption(
+        f"현재 기준: 평균 매입가보다 **{int(stop_loss_pct)}% 이상** 떨어지면 경고 표시. "
+        "이 값은 저장되어 다음에 접속해도 그대로 유지됩니다."
     )
 
     holdings = build_holdings(trades_df)

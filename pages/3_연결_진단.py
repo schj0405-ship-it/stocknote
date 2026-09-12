@@ -203,6 +203,21 @@ def step8_naver_financials():
     )
 
 
+def step8b_naver_price():
+    """
+    보유 현황의 '현재가'와 '매도 경고등'이 쓰는 주가 읽기가 이 서버에서
+    제대로 되는지 확인합니다. (이전에는 이 부분이 조용히 실패해서
+    현재가가 계속 '정보 없음'으로 보였습니다.)
+    """
+    from stock_price import get_current_price
+
+    get_current_price.clear()
+    price = get_current_price("005930")
+    if price is None:
+        raise RuntimeError("주가를 읽지 못했습니다(표 구조가 바뀌었거나 응답이 비어있음).")
+    return f"삼성전자 최근 종가: {price:,}원"
+
+
 def step9_other_sources():
     """
     나중에 더 좋은 방법으로 바꿀 수 있을지 미리 확인해둡니다.
@@ -252,6 +267,9 @@ if st.button("진단 시작", type="primary"):
 
     st.subheader("8단계. 네이버 재무데이터 읽기 (OpenDART 대체 경로)")
     results["naver_fin"] = _run("네이버 재무데이터", step8_naver_financials)[0]
+
+    st.subheader("8-2단계. 네이버 주가 읽기 (현재가·매도 경고등용)")
+    results["naver_price"] = _run("네이버 주가", step8b_naver_price)[0]
 
     st.subheader("9단계. 다른 데이터 제공처 연결 여부 (참고용)")
     _run("다른 제공처", step9_other_sources)
