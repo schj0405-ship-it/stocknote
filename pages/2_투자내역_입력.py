@@ -1,10 +1,17 @@
 import concurrent.futures
+import time
 from datetime import date
 
 import pandas as pd
 import streamlit as st
 
-from auth import get_supabase_client, read_setting, require_login, save_setting
+from auth import (
+    COOKIE_WRITE_WAIT_SECONDS,
+    get_supabase_client,
+    read_setting,
+    require_login,
+    save_setting,
+)
 from get_financial_data import find_stock_code
 from stock_price import get_current_price
 
@@ -582,6 +589,14 @@ else:
 
     if previous_stop_loss != int(stop_loss_pct):
         save_setting("stop_loss_pct", int(stop_loss_pct))
+        # [2026-09-16 버그 수정] 저장 지시를 브라우저에 실어 보낸 직후인데,
+        # 바로 이어서 아래에서 현재가를 불러오다가(네이버 응답 지연 등으로)
+        # 예상치 못한 오류가 나면, 화면이 도중에 멈추면서 방금 보낸 저장
+        # 지시가 브라우저에 도착하기도 전에 사라질 수 있습니다(로그인 저장 때와
+        # 똑같은 원리 - auth.py의 COOKIE_WRITE_WAIT_SECONDS 설명 참고). 그래서
+        # 값이 실제로 바뀐 경우에만 아주 잠깐 기다려서, 저장 지시가 브라우저에
+        # 확실히 전달된 뒤에 다음 코드(현재가 조회 등)로 넘어가도록 합니다.
+        time.sleep(COOKIE_WRITE_WAIT_SECONDS)
 
     st.caption(
         f"현재 기준: 평균 매입가보다 **{int(stop_loss_pct)}% 이상** 떨어지면 경고 표시. "

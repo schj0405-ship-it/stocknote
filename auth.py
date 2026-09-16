@@ -32,6 +32,10 @@ COOKIE_STORE_KEY = "stocknote_cookie_store"
 # 때까지 기다려주는 시간(초)입니다. 아래 _save_session 설명을 참고하세요.
 COOKIE_WRITE_WAIT_SECONDS = 1.2
 
+# _cookies_loaded()가 "진짜로 쿠키를 다 받아왔는지"를 확인하는 데 쓰는 카운터입니다.
+# 아래 _mark_cookie_boot_progress()/_cookies_loaded() 설명을 참고하세요.
+_COOKIES_BOOTED_KEY = f"_{COOKIE_STORE_KEY}_boot_runs"
+
 
 def _get_cookie_controller():
     """
@@ -74,6 +78,35 @@ def save_setting(name, value):
         pass
 
 
+def _mark_cookie_boot_progress():
+    """
+    [2026-09-16 버그 수정] 화면이 실행될 때마다 한 번씩 불러서, "쿠키 도구가
+    진짜 브라우저 쿠키값을 받아왔는지" 판단할 횟수를 세어둡니다.
+
+    원래 있던 _cookies_loaded()는 `COOKIE_STORE_KEY in st.session_state`로만
+    판단했는데, 이게 틀렸습니다. 쿠키 도구(streamlit_cookies_controller)의
+    내부 코드를 직접 열어보니, 화면이 처음 그려지는 바로 그 순간에 "아직
+    못 받아온 빈 값({})"을 st.session_state에 즉시 채워놓고 있었습니다.
+    즉 `COOKIE_STORE_KEY in st.session_state`는 쿠키를 받아오기도 전인
+    맨 처음부터 항상 참(True)이었던 것입니다.
+
+    그 결과: 화면을 새로 열 때마다(특히 로그인이 풀렸다가 다시 로그인할 때)
+    require_login()이 "확인 중입니다" 대신 곧바로 "로그인 후 사용할 수
+    있습니다"를 보여주며 화면을 멈췄습니다. 실제로는 아직 브라우저에서
+    저장된 로그인 정보(및 매도 경고 기준값)를 받아오기 전이었을 뿐입니다.
+    이 타이밍을 "로딩 끝남"으로 잘못 판단하면, 매도 경고 기준값처럼 화면에
+    보이는 값과 실제 저장된 값이 어긋나 보일 수 있습니다.
+
+    고친 방법: 쿠키값 자체가 아니라 "화면이 최소 한 번 더 다시 그려졌는지"로
+    판단합니다. 브라우저가 실제 쿠키를 보내오면 화면이 자동으로 한 번 더
+    그려지므로, 이 함수가 두 번째로 불릴 때는 진짜 쿠키를 받아온 뒤라고 볼
+    수 있습니다.
+    """
+    count = st.session_state.get(_COOKIES_BOOTED_KEY, 0)
+    if count < 2:
+        st.session_state[_COOKIES_BOOTED_KEY] = count + 1
+
+
 def _cookies_loaded():
     """
     브라우저에 저장된 쿠키를 실제로 읽어왔는지 여부입니다.
@@ -84,8 +117,10 @@ def _cookies_loaded():
     쿠키가 비어 있는 것처럼 보이고, 답이 도착하면 화면이 자동으로 한 번 더
     그려집니다. 이 함수는 "지금이 그 답을 받기 전인지, 후인지"를 구분해서,
     받기 전에는 '로그인하세요' 대신 '확인 중입니다'라고 보여주는 데 씁니다.
+
+    (판단 방법은 바로 위 _mark_cookie_boot_progress()의 설명을 참고하세요.)
     """
-    return COOKIE_STORE_KEY in st.session_state
+    return st.session_state.get(_COOKIES_BOOTED_KEY, 0) >= 2
 
 
 def get_supabase_client():
@@ -228,6 +263,10 @@ def render_auth_ui():
     화면 왼쪽 사이드바에 로그인/회원가입/로그아웃 UI를 그립니다.
     모든 페이지(app.py, pages/ 안의 파일들) 맨 위에서 한 번씩 불러주면 됩니다.
     """
+    # _cookies_loaded()가 "진짜 쿠키를 받아왔는지" 판단할 수 있도록, 화면이
+    # 실행될 때마다 여기서 횟수를 세어둡니다(자세한 설명은 그 함수 참고).
+    _mark_cookie_boot_progress()
+
     if "user" not in st.session_state:
         st.session_state["user"] = None
 
